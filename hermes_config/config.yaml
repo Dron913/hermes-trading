@@ -1,0 +1,31 @@
+model:
+  default: openai/gpt-oss-120b
+  provider: nvidia
+  base_url: https://integrate.api.nvidia.com/v1
+providers:
+  nvidia:
+    api_key: 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
+fallback_providers: []
+toolsets:
+  - hermes-cli
+agent:
+  max_turns: 45
+  api_max_retries: 4
+  disabled_toolsets: []
+  tool_use_enforcement: auto
+  task_completion_guidance: true
+  environment_probe: false
+  reasoning_effort: medium
+logging:
+  level: INFO
+model_catalog:
+  enabled: false
+compression:
+  enabled: false
+context:
+  engine: compressor
+network:
+  force_ipv4: false
+sessions:
+  auto_prune: false
+  retention_days: 1

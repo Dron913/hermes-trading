@@ -1,0 +1,42 @@
+version: "01"
+
+# Entry
+entry:
+  indicator: rsi
+  threshold: 45
+  direction: both   # long AND short allowed
+
+# Multi-timeframe trend filter (4H)
+trend_4h:
+  ema_fast: 50
+  ema_slow: 200
+  permit_long:  "ema_fast > ema_slow"
+  permit_short: "ema_fast < ema_slow"
+
+# Setup confirmation (1H)
+setup_1h:
+  rsi_threshold: 45
+  volume_avg_period: 20
+  volume_multiplier: 1.0
+
+# Entry trigger (15M)
+trigger_15m:
+  rsi_cross: 50
+  require_bullish_candle: true
+  price_must_be_above_ema50: true
+
+# Exit rules
+take_profit_pct:    4.0
+stop_loss_pct:      2.0
+early_exit_4h_cross: true
+early_exit_1h_rsi: 40
+
+# Position sizing
+risk_per_trade_pct:      1.0
+max_open_positions:      1
+no_averaging_down:       true
+no_martingale:           true
+
+# Asset selection
+assets: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+select_by_quality_score: true

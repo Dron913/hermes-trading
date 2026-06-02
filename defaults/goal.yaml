@@ -1,0 +1,6 @@
+assets:
+- BTC/USDT
+- ETH/USDT
+- SOL/USDT
+- XRP/USDT
+reflection_every: 2

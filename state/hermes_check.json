@@ -1,0 +1,10 @@
+{
+  "hermes_path": "C:\\Users\\DELL\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\hermes.EXE",
+  "hermes_found": true,
+  "hermes_reflection_mode": "true",
+  "uv_in_path": true,
+  "container": "railway",
+  "result": "HERMES_FOUND",
+  "python_version": "3.14.5 (main, May 10 2026, 20:29:46) [MSC v.1944 64 bit (AMD64)]",
+  "verification_mtime": "2026-05-31T18:46:57.254007+00:00"
+}

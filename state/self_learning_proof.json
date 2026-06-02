@@ -1,0 +1,107 @@
+{
+  "started_at": "2026-05-31T19:54:56.463870+00:00",
+  "steps": [
+    {
+      "step": 1,
+      "name": "trade_opened",
+      "timestamp": "2026-05-31T19:54:56.463877+00:00",
+      "asset": "BTC/USDT",
+      "side": "short",
+      "entry_price": 73800.0
+    },
+    {
+      "step": 2,
+      "name": "trade_closed",
+      "timestamp": "2026-05-31T19:54:56.474733+00:00",
+      "pnl_pct": 0.34,
+      "exit_reason": "take_profit"
+    },
+    {
+      "step": 5,
+      "name": "hypothesis_generated",
+      "timestamp": "2026-05-31T19:55:16.841035+00:00",
+      "variable": "early_exit_1h_rsi",
+      "direction": "loosen",
+      "amount": 5.0,
+      "reason": "The loss was caused by an early stop\u00e2\u20ac\u2018loss triggered after a rapid momentum reversal. Lowering the 1\u00e2\u20ac\u2018hour RSI exit threshold from 40 to 35 will reduce premature exits, allowing trades more room to recover and increasing the likelihood of reaching the 4\u00e2\u20ac\u00af% take\u00e2\u20ac\u2018profit target."
+    },
+    {
+      "step": 6,
+      "name": "strategy_modified",
+      "timestamp": "2026-05-31T19:55:16.871371+00:00",
+      "old_version": "v0005",
+      "new_version": "v0006",
+      "variable_changed": "early_exit_1h_rsi",
+      "old_value": 40,
+      "new_value": 35.0,
+      "direction": "loosen"
+    },
+    {
+      "step": 7,
+      "name": "version_bumped",
+      "timestamp": "2026-05-31T19:55:16.888039+00:00",
+      "from": "v0005",
+      "to": "v0006"
+    },
+    {
+      "step": 8,
+      "name": "history_saved",
+      "timestamp": "2026-05-31T19:55:16.902091+00:00",
+      "history_path": "C:\\Users\\DELL\\hermes-trading\\state\\history\\v0006.yaml"
+    },
+    {
+      "step": 1,
+      "name": "trade_opened",
+      "timestamp": "2026-05-31T19:55:48.843417+00:00",
+      "asset": "BTC/USDT",
+      "side": "short",
+      "entry_price": 73800.0
+    },
+    {
+      "step": 2,
+      "name": "trade_closed",
+      "timestamp": "2026-05-31T19:55:48.854327+00:00",
+      "pnl_pct": 0.34,
+      "exit_reason": "take_profit"
+    },
+    {
+      "step": 5,
+      "name": "hypothesis_generated",
+      "timestamp": "2026-05-31T19:56:34.536825+00:00",
+      "variable": "stop_loss_pct",
+      "direction": "increase",
+      "amount": 0.5,
+      "reason": "Increasing stop loss from 1.5% to 2.0% gives trades more room to survive quick reversals, reducing the observed loss while preserving overall risk exposure."
+    },
+    {
+      "step": 6,
+      "name": "strategy_modified",
+      "timestamp": "2026-05-31T19:56:34.562788+00:00",
+      "old_version": "v0006",
+      "new_version": "v0007",
+      "variable_changed": "stop_loss_pct",
+      "old_value": 1.5,
+      "new_value": 2.0,
+      "direction": "increase"
+    },
+    {
+      "step": 7,
+      "name": "version_bumped",
+      "timestamp": "2026-05-31T19:56:34.576270+00:00",
+      "from": "v0006",
+      "to": "v0007"
+    },
+    {
+      "step": 8,
+      "name": "history_saved",
+      "timestamp": "2026-05-31T19:56:34.588962+00:00",
+      "history_path": "C:\\Users\\DELL\\hermes-trading\\state\\history\\v0007.yaml"
+    },
+    {
+      "step": 9,
+      "name": "pushed_to_railway",
+      "timestamp": "2026-05-31T19:56:37.703224+00:00",
+      "push_id": "Indexing...\nUploading...\n  Build Logs: https://railway.com/project/e2ea383f-e8c5-4795-a772-7d67599c3bb5/service/80ee7b60-d6ff-4757-80f2-b29c90769a58?id=c1ede972-4c37-41fd-8014-dc3565d65123&"
+    }
+  ]
+}

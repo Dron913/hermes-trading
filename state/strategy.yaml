@@ -1,0 +1,32 @@
+assets:
+- BTC/USDT
+- ETH/USDT
+- SOL/USDT
+early_exit_1h_rsi: 35.0
+early_exit_4h_cross: false
+entry:
+  direction: both
+  indicator: rsi
+  threshold: 30
+max_open_positions: 4
+no_averaging_down: true
+no_martingale: true
+position_size_r: 0.55
+risk_per_trade_pct: 1.0
+select_by_quality_score: true
+setup_1h:
+  rsi_threshold: 30
+  volume_avg_period: 20
+  volume_multiplier: 0.5
+stop_loss_pct: 2.0
+take_profit_pct: 4.0
+trend_4h:
+  ema_fast: 100
+  ema_slow: 200
+  permit_long: ema_fast > ema_slow
+  permit_short: ema_fast < ema_slow
+trigger_15m:
+  price_must_be_above_ema50: true
+  require_bullish_candle: true
+  rsi_cross: 50
+version: v0007
