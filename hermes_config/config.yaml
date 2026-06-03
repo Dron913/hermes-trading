@@ -4,7 +4,7 @@ model:
   base_url: https://integrate.api.nvidia.com/v1
 providers:
   nvidia:
-    api_key: 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
+    api_key: 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
 fallback_providers: []
 toolsets:
   - hermes-cli
