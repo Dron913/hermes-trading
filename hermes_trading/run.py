@@ -81,19 +81,25 @@ def verify_hermes_install():
         except Exception:
             console.print("SKIPPED")
         console.print(f"  [7] NIM API reachable:      CHECKING...")
-        try:
-            from urllib.request import Request, urlopen
-            req = Request(
-                "https://integrate.api.nvidia.com/v1/models",
-                headers={"Authorization": "Bearer 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",
-                         "User-Agent": "Hermes-Trading/1.0"}
-            )
-            with urlopen(req, timeout=10) as resp:
-                console.print(f"  [7] NIM API reachable:     YES (HTTP 200)" if resp.status == 200
-                              else f"  [7] NIM API reachable:     HTTP {resp.status}")
-                nim_ok = resp.status == 200
-        except Exception as e:
-            console.print(f"  [7] NIM API reachable:     ERROR: {e}")
+        nim_api_key = os.getenv("NIM_API_KEY", "")
+        if not nim_api_key:
+            console.print(f"  [7] NIM API reachable:     ERROR: NIM_API_KEY not set")
+            nim_ok = False
+        else:
+            try:
+                from urllib.request import Request, urlopen
+                req = Request(
+                    "https://integrate.api.nvidia.com/v1/models",
+                    headers={"Authorization": f"Bearer {nim_api_key}",
+                             "User-Agent": "Hermes-Trading/1.0"}
+                )
+                with urlopen(req, timeout=10) as resp:
+                    console.print(f"  [7] NIM API reachable:     YES (HTTP 200)" if resp.status == 200
+                                  else f"  [7] NIM API reachable:     HTTP {resp.status}")
+                    nim_ok = resp.status == 200
+            except Exception as e:
+                console.print(f"  [7] NIM API reachable:     ERROR: {e}")
+                nim_ok = False
         result = "HERMES_FOUND"
     else:
         console.print(f"  [2] hermes binary:          NOT INSTALLED")
@@ -227,20 +233,27 @@ def _health_server():
                 _auth["token"] = None
                 self._set_headers(200)
                 self.wfile.write(b'{"ok":true}')
-            elif self.path == "/debug/state":
-                if _auth["enabled"] and not _auth_ok(self.headers.get("Authorization", "").replace("Bearer ", "")):
+            elif self.path.startswith("/debug/state"):
+                # Extract token from query string for auth check
+                token = self.path.split("?token=", 1)[-1].split("&")[0] if "?token=" in self.path else None
+                if _auth["enabled"] and not _auth_ok(token):
                     self._set_headers(401)
                     self.wfile.write(b'{"error":"unauthorized"}')
                     return
                 try:
-                    length = int(self.headers.get("Content-Length", 0))
-                    data = json.loads(self.rfile.read(length))
-                    for fname, content in data.items():
-                        fp = _STATE_ROOT / fname
-                        fp.parent.mkdir(parents=True, exist_ok=True)
-                        fp.write_text(content, encoding="utf-8")
-                    self._set_headers(200)
-                    self.wfile.write(b"restored")
+                    if self.command == "POST":
+                        length = int(self.headers.get("Content-Length", 0))
+                        data = json.loads(self.rfile.read(length))
+                        for fname, content in data.items():
+                            fp = _STATE_ROOT / fname
+                            fp.parent.mkdir(parents=True, exist_ok=True)
+                            fp.write_text(content, encoding="utf-8")
+                        self._set_headers(200)
+                        self.wfile.write(b"restored")
+                    else:
+                        # GET — handled in do_GET
+                        self._set_headers(405)
+                        self.wfile.write(b'{"error":"GET not allowed here"}')
                 except Exception as e:
                     self._set_headers(500)
                     self.wfile.write(str(e).encode())

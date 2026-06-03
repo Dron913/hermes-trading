@@ -575,28 +575,119 @@ Output only the JSON object."""
 
 
 def parse_hermes_output(output: str) -> dict:
+    """Extract JSON from LLM output using robust character-by-character scanning.
+    Handles embedded braces, multi-line strings, and various output formats.
+    Falls back to default only after exhausting all parsing attempts."""
     import re, json as _json
-    # Try to extract first valid JSON object from output (handles arrays too)
-    m = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', output, re.DOTALL)
-    if not m:
-        # Fallback: try raw match
-        m = re.search(r'\{.*\}', output, re.DOTALL)
-    if m:
-        try:
-            data = _json.loads(m.group())
-            # If array, take first element
-            if isinstance(data, list) and len(data) > 0:
-                data = data[0]
-            return {
-                "variable": data["variable"],
-                "direction": data["direction"],
-                "amount": float(data["amount"]),
-                "reason": data["reason"]
-            }
-        except (_json.JSONDecodeError, KeyError, ValueError):
-            pass
+
+    # Try greedy JSON extraction first — handles most common cases
+    # Find all complete JSON objects in the output
+    objects = _extract_all_json_objects(output)
+    if objects:
+        for obj in objects:
+            result = _try_parse_hermes_json(obj)
+            if result:
+                return result
+
+    # Try regex extraction as fallback
+    patterns = [
+        r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}',           # Single-nested braces
+        r'\{[\s\S]*?\}',                               # Lazy (minimal) match
+        r'\{.*\}',                                     # Greedy (may over-match)
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, output, re.DOTALL)
+        if m:
+            result = _try_parse_hermes_json(m.group())
+            if result:
+                return result
+
+    # All parsing attempts failed — return default fallback
     return {"variable": "entry.rsi_threshold", "direction": "loosen", "amount": 2,
             "reason": "Hermes parse failed — default fallback: loosen RSI threshold."}
+
+
+def _extract_all_json_objects(text: str) -> list:
+    """Scan text for complete JSON objects using bracket depth tracking.
+    Handles strings with embedded quotes and escaped characters."""
+    results = []
+    depth = 0
+    in_string = False
+    escape_next = False
+    obj_start = -1
+
+    for i, c in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+        if c == '\\' and in_string:
+            escape_next = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+
+        if c == '{':
+            if depth == 0:
+                obj_start = i
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0 and obj_start != -1:
+                obj_text = text[obj_start:i+1]
+                if obj_text.strip():
+                    results.append(obj_text)
+                obj_start = -1
+
+    return results
+
+
+def _try_parse_hermes_json(text: str) -> Optional[dict]:
+    """Attempt to extract a valid hypothesis from JSON text."""
+    import json as _json
+    try:
+        data = _json.loads(text)
+        if isinstance(data, list) and len(data) > 0:
+            data = data[0]
+        if isinstance(data, dict) and "variable" in data:
+            # Validate required fields
+            if not data.get("direction") or not data.get("amount"):
+                return None
+            # Normalize direction
+            direction = str(data.get("direction", "")).lower().strip()
+            if direction not in ("loosen", "tighten", "increase", "decrease"):
+                # Try to normalize common variations
+                direction_map = {
+                    "loosen": "loosen", "relax": "loosen", "relaxed": "loosen",
+                    "relaxing": "loosen", "more": "loosen",
+                    "tighten": "tighten", "stricter": "tighten",
+                    "increase": "increase", "inc": "increase", "higher": "increase",
+                    "raise": "increase", "larger": "increase",
+                    "decrease": "decrease", "dec": "decrease", "lower": "decrease",
+                    "reduce": "decrease", "smaller": "decrease",
+                }
+                direction = direction_map.get(direction, direction)
+
+            # Normalize amount
+            amount = data.get("amount")
+            if amount is None:
+                return None
+            try:
+                amount = float(amount)
+            except (ValueError, TypeError):
+                return None
+
+            return {
+                "variable": str(data["variable"]),
+                "direction": direction,
+                "amount": amount,
+                "reason": str(data.get("reason", ""))
+            }
+    except (_json.JSONDecodeError, KeyError, TypeError, ValueError):
+        pass
+    return None
 
 
 def _hermes_context() -> dict:
@@ -607,10 +698,59 @@ def _hermes_context() -> dict:
     }
 
 
+# Valid bounds for key strategy parameters (for safety validation)
+PARAM_BOUNDS = {
+    "rsi_threshold":          (0, 80),      # 0-80 for entry RSI
+    "threshold":               (0, 80),      # 0-80 for setup thresholds
+    "early_exit_1h_rsi":       (10, 70),     # 10-70 for exit RSI
+    "stop_loss_pct":           (0.2, 5.0),   # 0.2%-5% stop loss
+    "take_profit_pct":         (0.5, 10.0),  # 0.5%-10% take profit
+    "position_size_r":         (0.1, 2.0),   # 0.1-2.0 R per trade
+    "risk_per_trade_pct":      (0.1, 3.0),   # 0.1-3% risk per trade
+    "ema_fast":                (10, 500),     # 10-500 for EMA fast
+    "ema_slow":                (20, 800),     # 20-800 for EMA slow
+    "volume_multiplier":       (0.2, 5.0),   # 0.2-5x volume filter
+    "max_open_positions":      (1, 8),        # 1-8 max positions
+    "risk_score":              (0, 100),      # 0-100 risk score
+}
+
+
+def _validate_and_apply(d: dict, key: str, direct: str, val: float) -> bool:
+    """Apply validated change to strategy dict. Returns True if change was applied."""
+    current = d.get(key, None)
+    if current is None:
+        return True  # Allow creating new keys
+
+    delta = val if direct in ("tighten", "increase", "decrease", "loosen") else 0
+    if direct == "loosen":
+        delta = -abs(val)
+    elif direct == "decrease":
+        delta = -abs(val)
+    elif direct == "tighten":
+        delta = abs(val)
+    elif direct == "increase":
+        delta = abs(val)
+
+    new_val = round(current + delta, 2)
+
+    # Validate against bounds if they exist for this key
+    if key in PARAM_BOUNDS:
+        lo, hi = PARAM_BOUNDS[key]
+        if not (lo <= new_val <= hi):
+            print(f"[YELLOW]  StrategyGuard: {key}={current} -> {new_val} "
+                  f"exceeds bounds [{lo}, {hi}] — clamp to nearest valid[/YELLOW]")
+            new_val = max(lo, min(hi, new_val))
+
+    d[key] = new_val
+    print(f"[GREEN]  StrategyGuard: {key}={current} -> {new_val}[/GREEN]")
+    return True
+
+
 def apply_hypothesis(hypothesis: dict, strategy_path: Path, hypotheses_path: Path,
                     ctx: dict, total_trades: int = 0, trades: List[dict] = None) -> str:
     strategy = yaml.safe_load(strategy_path.read_text())
     new_version = bump_version(strategy["version"])
+    prev_version = strategy["version"]
 
     # Apply change to strategy dict
     var = hypothesis["variable"]
@@ -623,14 +763,8 @@ def apply_hypothesis(hypothesis: dict, strategy_path: Path, hypotheses_path: Pat
         d = d.setdefault(p, {})
     key = parts[-1]
 
-    if direct == "loosen":
-        d[key] = round(d.get(key, 0) - val, 2)
-    elif direct == "tighten":
-        d[key] = round(d.get(key, 0) + val, 2)
-    elif direct == "increase":
-        d[key] = round(d.get(key, 0) + val, 2)
-    elif direct == "decrease":
-        d[key] = round(d.get(key, 0) - val, 2)
+    # Validate and apply with bounds checking
+    applied = _validate_and_apply(d, key, direct, val)
 
     strategy["version"] = new_version
 

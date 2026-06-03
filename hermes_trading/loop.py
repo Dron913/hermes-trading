@@ -352,18 +352,84 @@ class TradingLoop:
                     hermes_ok = shutil.which("hermes") is not None
                     if hermes_ok:
                         from .reflect import run_hermes_reflection
-                        hyp = await run_hermes_reflection(trades, self.strategy_path, self.trades_path, self.hypotheses_path)
-                        console.print(f"[green]Hermes reflection applied[/green]")
+                        # Retry logic: try Hermes up to 2 times before fallback
+                        hermes_success = False
+                        for attempt in range(2):
+                            try:
+                                hyp = await run_hermes_reflection(trades, self.strategy_path, self.trades_path, self.hypotheses_path)
+                                # Check if Hermes actually produced a real response (not the fallback message)
+                                if hyp.get("reason") and "Hermes parse failed" not in hyp.get("reason", ""):
+                                    hermes_success = True
+                                    console.print(f"[green]Hermes reflection applied (attempt {attempt + 1})[/green]")
+                                    break
+                                else:
+                                    console.print(f"[yellow]Hermes parse failed, attempt {attempt + 1}/2 — retrying...[/yellow]")
+                                    if attempt == 1:
+                                        console.print(f"[yellow]Hermes failed {2} consecutive times — using fallback[/yellow]")
+                            except Exception as hermes_err:
+                                console.print(f"[red]Hermes error on attempt {attempt + 1}: {hermes_err}[/red]")
+                                if attempt == 1:
+                                    console.print(f"[red]Hermes exhausted all retries — using fallback[/red]")
+                        if not hermes_success:
+                            self._run_fallback_safe(trades)
                     else:
-                        from .reflect import run_fallback_reflection
-                        hyp = run_fallback_reflection(trades, self.strategy_path, self.trades_path, self.hypotheses_path)
+                        self._run_fallback_safe(trades)
                         console.print(f"[yellow]Fallback reflection applied (hermes CLI not in container)[/yellow]")
                 else:
-                    from .reflect import run_fallback_reflection
-                    hyp = run_fallback_reflection(trades, self.strategy_path, self.trades_path, self.hypotheses_path)
-                    console.print(f"[yellow]Fallback reflection applied[/yellow]")
+                    self._run_fallback_safe(trades)
+                    console.print(f"[yellow]Fallback reflection applied (HERMES_REFLECTION_MODE not true)[/yellow]")
             else:
                 console.print(f"[yellow]Skipping reflection — only {len(trades)} trades, need {MIN_TRADES_FOR_MODIFICATION}+ for reliable analysis[/yellow]")
+
+    def _run_fallback_safe(self, trades: list):
+        """Run fallback reflection with spam guard and corrupted value recovery."""
+        from .reflect import run_fallback_reflection, _compute_trade_stats
+
+        # Strategy health check — detect corrupted values
+        try:
+            import yaml as _yaml
+            strat = _yaml.safe_load(self.strategy_path.read_text())
+            rsi = strat.get("entry", {}).get("rsi_threshold", 30)
+            if rsi < 0 or rsi > 80:
+                console.print(f"[bold red]StrategyCorruption: rsi_threshold={rsi} is invalid — "
+                              f"resetting to safe value 30[/bold red]")
+                d = strat.setdefault("entry", {})
+                d["rsi_threshold"] = 30
+                d["threshold"] = 30
+                strat.setdefault("setup_1h", {})["rsi_threshold"] = 30
+                self.strategy_path.write_text(_yaml.dump(strat))
+        except Exception as e:
+            console.print(f"[red]Strategy health check error: {e}[/red]")
+
+        # Spam guard: track consecutive fallbacks to detect repeated failures
+        hyp_path = self.hypotheses_path
+        consecutive_fallback = 0
+        if hyp_path.exists():
+            try:
+                lines = [l.strip() for l in hyp_path.read_text().strip().split("\n") if l.strip()]
+                last_entries = lines[-5:] if len(lines) >= 5 else lines
+                # Check if last 3 were all fallbacks with the same change
+                same_vars = {}
+                for l in last_entries:
+                    try:
+                        h = json.loads(l)
+                        if h.get("mode") == "fallback" or (h.get("reason") or "").includes("Hermes parse failed"):
+                            v = h.get("variable", "unknown")
+                            same_vars[v] = same_vars.get(v, 0) + 1
+                    except json.JSONDecodeError:
+                        pass
+                # If same variable changed 3+ times in a row, halt fallback spam
+                for var, count in same_vars.items():
+                    if count >= 3:
+                        console.print(f"[bold red]SpamGuard: {var} modified {count}x in a row — "
+                                      f"skipping fallback, waiting for Hermes[/bold red]")
+                        return
+            except Exception:
+                pass
+
+        from .reflect import run_fallback_reflection
+        hyp = run_fallback_reflection(trades, self.strategy_path, self.trades_path, self.hypotheses_path)
+        console.print(f"[yellow]Fallback reflection applied[/yellow]")
 
     def _read_trades(self) -> list:
         if not self.trades_path.exists():
