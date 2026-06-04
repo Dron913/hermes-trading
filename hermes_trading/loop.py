@@ -24,10 +24,44 @@ console = Console()
 
 
 class StatusWriter:
-    """Writes status.json each cycle so dashboard API can read open positions."""
+    """Writes status.json each cycle so dashboard API can read open positions + paper account."""
+
+    # Fixed constants for paper account computation
+    MAX_POSITIONS = 4
+    MAX_POSITION_PCT = 0.25  # max 25% per position
 
     def __init__(self, path: Path):
         self.path = path
+        self._pa_path = path.parent / "paper_account.yaml"
+        self._starting_balance = self._load_starting_balance()
+
+    def _load_starting_balance(self) -> float:
+        """Load starting balance from paper_account.yaml. Create with default $100k if missing."""
+        try:
+            if self._pa_path.exists():
+                data = yaml.safe_load(self._pa_path.read_text())
+                return float(data.get("starting_balance", 100_000.0))
+            # First boot: set default starting balance
+            default = {"starting_balance": 100_000.0}
+            self._pa_path.write_text(yaml.dump(default))
+            return 100_000.0
+        except Exception:
+            return 100_000.0
+
+    def _compute_realized_pnl(self) -> float:
+        """Sum realized P&L (as %) across all closed trades, convert to USD."""
+        trades_path = self.path.parent / "trades.jsonl"
+        if not trades_path.exists():
+            return 0.0
+        total_pct = 0.0
+        try:
+            for line in trades_path.read_text().strip().split("\n"):
+                if line.strip():
+                    t = json.loads(line)
+                    total_pct += float(t.get("pnl_pct", 0.0))
+        except Exception:
+            pass
+        return round(total_pct * self._starting_balance / 100, 2)
 
     def write(self, positions: dict[str, dict], strategy: dict,
               tf_data_map: dict | None = None) -> None:
@@ -57,10 +91,32 @@ class StatusWriter:
                     "sl": strategy.get("stop_loss_pct", "?"),
                     "tp": strategy.get("take_profit_pct", "?"),
                 })
-            self.path.write_text(json.dumps({
+
+            # Paper account metrics
+            realized_pnl = self._compute_realized_pnl()
+            unrealized_pnl_usd = sum(
+                p.get("unrealized_pnl", 0.0) * self._starting_balance / 100
+                for p in expanded
+            ) if expanded else 0.0
+            current_balance = round(self._starting_balance + realized_pnl, 2)
+            capital_per_pos = self._starting_balance * self.MAX_POSITION_PCT
+            deployed = len(expanded) * capital_per_pos
+            available = round(current_balance - deployed + unrealized_pnl_usd, 2)
+
+            status = {
                 "open_positions": expanded,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-            }))
+                "paper_account": {
+                    "starting_balance": self._starting_balance,
+                    "current_balance": current_balance,
+                    "realized_pnl_usd": realized_pnl,
+                    "unrealized_pnl_usd": round(unrealized_pnl_usd, 2),
+                    "available_capital": available,
+                    "deployed_capital": deployed,
+                    "capital_utilization_pct": round(deployed / self._starting_balance * 100, 1),
+                },
+            }
+            self.path.write_text(json.dumps(status, indent=2))
         except Exception:
             pass  # Non-critical
 
@@ -178,22 +234,33 @@ class TradingLoop:
                 if side == "short":
                     pnl_pct = -pnl_pct
 
-                should_exit = (
-                    pnl_pct >= tp or
-                    pnl_pct <= -sl or
-                    (side == "long" and h1["rsi"] < strategy["early_exit_1h_rsi"]) or
-                    (side == "short" and h1["rsi"] > (100 - strategy["early_exit_1h_rsi"]))
-                )
+                should_exit_tp = pnl_pct >= tp
+                should_exit_sl = pnl_pct <= -sl
+                should_exit_rsi = (side == "long" and h1["rsi"] < strategy["early_exit_1h_rsi"]) or \
+                                 (side == "short" and h1["rsi"] > (100 - strategy["early_exit_1h_rsi"]))
+
+                # Track MFE/MAE on every evaluation tick (including final tick before close)
+                pos["_mfe"] = max(pos["_mfe"], pnl_pct)
+                pos["_mae"] = min(pos["_mae"], pnl_pct)
+
+                # Determine specific exit reason (priority: TP > SL > RSI > exit)
+                if should_exit_tp:
+                    exit_reason_str = "take_profit"
+                elif should_exit_sl:
+                    exit_reason_str = "stop_loss"
+                elif should_exit_rsi:
+                    exit_reason_str = "early_exit_1h_rsi"
+                else:
+                    exit_reason_str = "exit"  # no specific signal triggered
+
+                should_exit = should_exit_tp or should_exit_sl or should_exit_rsi
 
                 if should_exit:
-                    await self.close_trade(asset, side, entry_price, h1["close"], pnl_pct, "exit", tf_data, strategy, pos)
+                    await self.close_trade(asset, side, entry_price, h1["close"], pnl_pct, exit_reason_str, tf_data, strategy, pos)
                     del self._positions[asset]
                     closes_triggered += 1
                 else:
-                    # Track MFE/MAE for Exit Intelligence (pnl_pct is signed: positive = winning)
-                    pos["_mfe"] = max(pos["_mfe"], pnl_pct)
-                    pos["_mae"] = min(pos["_mae"], pnl_pct)
-                    # Already in this asset — skip entry, keep monitoring
+                    # No exit — continue tracking
                     q_scores = {a: sc for sc, a, _ in rated}
                     sys.stdout.write(
                         f"TRACK {asset} {side.upper()} entry={entry_price:.2f} "

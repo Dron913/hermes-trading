@@ -128,7 +128,7 @@ STATE_FILES = [
     "events.jsonl", "status.json", "heartbeat.json", "bootstrap_proof.json",
     "hermes_check.json", "self_learning_proof.json", "knowledge.jsonl",
     "exit_intelligence.jsonl", "phase_state.json", "asset_exit_stats.json",
-    "recommendations.jsonl", "shadow_trades.jsonl",
+    "recommendations.jsonl", "shadow_trades.jsonl", "paper_account.yaml",
 ] if os.getenv("STATE_DIR") else []
 _STATE_ROOT = Path(os.getenv("STATE_DIR", str(Path(__file__).parent.parent) + "/state"))
 
