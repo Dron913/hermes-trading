@@ -20,7 +20,13 @@ from .exit_intelligence_store import ExitIntelligenceStore, TRACKED_ASSETS
 # ------------------------------------------------------------------
 
 def generate_deterministic_observations(trade: dict) -> List[dict]:
-    """Generate exit observations using rules only — no AI needed."""
+    """Generate exit observations using rules only — no AI needed.
+
+    New trades can trigger many more observation types thanks to:
+    - Specific exit_reason values (take_profit, stop_loss, early_exit_1h_rsi)
+    - MFE/MAE tracked at the final tick before exit
+    - Quality scoring context (ceiling capture ratios)
+    """
     observations = []
     mfe = trade.get("mfe_pct", 0.0)
     mae = trade.get("mae_pct", 0.0)
@@ -30,76 +36,125 @@ def generate_deterministic_observations(trade: dict) -> List[dict]:
     asset = trade.get("asset", "?")
     is_win = pnl >= 0
 
-    # 1. Exited too early (significant ceiling missed)
+    # 1. Take profit hit — clean, profitable exit at the target
+    # Fires for all trades that hit TP (mfe may or may not be available)
+    if exit_reason == "take_profit":
+        observations.append({
+            "type": "take_profit_hit",
+            "detail": f"{asset} TP triggered — exit at {pnl:+.2f}%, "
+                      f"MFE={mfe:+.2f}% ({round(pnl/mfe*100) if mfe > 0 else 'n/a'}% of ceiling)",
+            "confidence": 0.80,
+        })
+        return observations  # TP exits don't need further analysis
+
+    # 2. Stop loss was appropriate — saved from worse loss
+    if exit_reason == "stop_loss":
+        mae_ratio = abs(mae) / abs(pnl) if pnl != 0 else 0
+        if mae_ratio < 0.8:  # MAE shows we were heading for worse
+            observations.append({
+                "type": "stop_loss_appropriate",
+                "detail": f"{asset} SL saved from larger loss — MAE {mae:+.2f}% vs "
+                          f"stopped at {pnl:+.2f}%",
+                "confidence": 0.72,
+            })
+        elif mae_ratio > 1.2 and is_win:  # MAE proves we recovered after stop
+            observations.append({
+                "type": "stop_loss_unnecessary",
+                "detail": f"{asset} stopped at {pnl:+.2f}% but recovered — MAE {mae:+.2f}% "
+                          f"(stop was premature)",
+                "confidence": 0.65,
+            })
+        else:
+            observations.append({
+                "type": "stop_loss",
+                "detail": f"{asset} stopped out at {pnl:+.2f}%, MAE {mae:+.2f}%",
+                "confidence": 0.55,
+            })
+        return observations  # stop_loss exits done
+
+    # 3. Early exit (RSI signal) on a winning trade — trend may have continued
+    if exit_reason == "early_exit_1h_rsi":
+        if is_win:
+            observations.append({
+                "type": "trend_exhausted",
+                "detail": f"{asset} exited via RSI signal at {pnl:+.2f}% — "
+                          f"trend may have continued",
+                "confidence": 0.62,
+            })
+        else:
+            observations.append({
+                "type": "early_exit_loss",
+                "detail": f"{asset} exited via RSI signal at {pnl:+.2f}% — "
+                          f"loss suggests exit was appropriate",
+                "confidence": 0.58,
+            })
+        return observations
+
+    # --- Generic exit (no specific signal matched) ---
+    # For these, MFE is the primary differentiator
+
+    # 4. Significant ceiling missed (>75% of ceiling lost)
     if mfe > 0 and pnl < mfe * 0.25:
-        diff = round(mfe - pnl, 2) if pnl > 0 else round(mfe, 2)
         pct_cap = round(pnl / mfe * 100, 1) if mfe > 0 else 0
         observations.append({
             "type": "exited_too_early",
             "detail": f"{asset}: Ceiling {mfe:+.2f}% vs actual {pnl:+.2f}% — "
-                       f"only {pct_cap}% captured, {diff:+.2f}% left on table",
+                      f"only {pct_cap}% of MFE captured",
             "confidence": min(round((mfe - pnl) / mfe, 2) if mfe > 0 else 0.5, 0.95),
         })
 
-    # 2. Momentum still existed (short duration but profitable)
-    if dur_sec < 7200 and is_win and mfe > pnl * 1.2:  # < 2h and good run left
+    # 5. Momentum still existed (short duration, profitable, room left)
+    if dur_sec < 7200 and is_win and mfe > 0 and mfe > pnl * 1.2:  # < 2h and room left
         observations.append({
             "type": "momentum_still_existed",
-            "detail": f"{asset} exited in {dur_sec // 3600}h{(dur_sec % 3600) // 60}m — "
-                       f"profitable but MFE showed {mfe - pnl:+.2f}% more was available",
-            "confidence": 0.65,
+            "detail": f"{asset} exited in {dur_sec // 3600}h{dur_sec % 3600 // 60}m — "
+                      f"profit {pnl:+.2f}% but {mfe - pnl:+.2f}% additional was available",
+            "confidence": 0.68,
         })
 
-    # 3. Trend exhausted (early exit RSI triggered on winners)
-    if exit_reason == "early_exit_1h_rsi" and is_win and pnl > 0:
+    # 6. Good ceiling capture but not TP (50-85% of MFE) — solid exit
+    if mfe > 0 and pnl >= mfe * 0.50 and pnl < mfe * 0.85 and is_win:
         observations.append({
-            "type": "trend_exhausted",
-            "detail": f"{asset} exit triggered by RSI but trade was already profitable ({pnl:+.2f}%) — "
-                       f"could have held for more",
-            "confidence": 0.58,
-        })
-
-    # 4. Stop loss was appropriate
-    if exit_reason == "stop_loss" and mae < abs(pnl) * 0.8:
-        observations.append({
-            "type": "stop_loss_appropriate",
-            "detail": f"{asset} stop loss saved from larger loss — MAE {mae:+.2f}% vs "
-                       f"actual PnL {pnl:+.2f}%",
+            "type": "good_ceiling_capture",
+            "detail": f"{asset} captured {round(pnl/mfe*100)}% of {mfe:+.2f}% ceiling — "
+                      f"exit at {pnl:+.2f}%",
             "confidence": 0.70,
         })
 
-    # 5. Stop loss was unnecessary (stopped out before recovery)
-    if exit_reason == "stop_loss" and mae > abs(pnl) * 1.3 and is_win:
+    # 7. Loss exit that caught good MFE before reversal
+    if mfe > 0 and not is_win and mfe > abs(pnl):  # had profit but gave it back
         observations.append({
-            "type": "stop_loss_unnecessary",
-            "detail": f"{asset} stopped out but recovered — MAE {mae:+.2f}% vs "
-                       f"actual close {pnl:+.2f}% (would have won)",
-            "confidence": 0.62,
+            "type": "gave_back_profit",
+            "detail": f"{asset} MFE was {mfe:+.2f}% but closed at {pnl:+.2f}% — "
+                      f"gave back {mfe - abs(pnl):+.2f}%",
+            "confidence": 0.65,
         })
 
-    # 6. Take profit hit at target
-    if exit_reason == "take_profit" and is_win:
-        observations.append({
-            "type": "exited_correctly",
-            "detail": f"{asset} TP hit — clean exit at {pnl:+.2f}%",
-            "confidence": 0.80,
-        })
-
-    # 7. Duration too long / trend exhausted (profitable but very long)
-    if dur_sec > 86400 and is_win and mfe > 0 and pnl < mfe * 0.6:  # > 24h
+    # 8. Long hold, decent capture (24h+ but captured <60% of MFE)
+    if dur_sec > 86400 and mfe > 0 and pnl < mfe * 0.6:  # > 24h
         observations.append({
             "type": "ceiling_missed",
-            "detail": f"{asset} held {dur_sec // 3600}h but only captured "
-                       f"{round(pnl/mfe*100)}% of potential MFE {mfe:+.2f}%",
+            "detail": f"{asset} held {dur_sec // 3600}h captured "
+                      f"{round(pnl/mfe*100)}% of MFE {mfe:+.2f}%",
             "confidence": 0.55,
         })
 
+    # 9. Generic exit with no MFE — truly unknown quality
+    if mfe == 0:
+        observations.append({
+            "type": "exited_correctly",
+            "detail": f"{asset} exited at {pnl:+.2f}%, duration={dur_sec}s — "
+                      f"no excursion data available",
+            "confidence": 0.50,
+        })
+
+    # Fallback: exit with MFE but no other condition matched
     if not observations:
         observations.append({
             "type": "exited_correctly",
-            "detail": f"{asset} exit: no systematic pattern detected. "
-                       f"MFE={mfe:+.2f}%, MAE={mae:+.2f}%, PnL={pnl:+.2f}%",
-            "confidence": 0.50,
+            "detail": f"{asset} exit: MFE={mfe:+.2f}%, MAE={mae:+.2f}%, "
+                      f"PnL={pnl:+.2f}%, dur={dur_sec}s",
+            "confidence": 0.55,
         })
 
     return observations
@@ -110,31 +165,51 @@ def generate_deterministic_observations(trade: dict) -> List[dict]:
 # ------------------------------------------------------------------
 
 def exit_quality_score(trade: dict) -> float:
-    """Deterministic exit quality score 0.0–1.0."""
+    """Deterministic exit quality score 0.0–1.0.
+
+    Principles:
+    - Exit reason is a strong signal even when MFE is 0.
+    - 'take_profit' means we captured the ceiling — score high regardless.
+    - 'stop_loss' quality depends on whether the loss was necessary.
+    - 'early_exit_1h_rsi' quality depends on whether the trade was winning.
+    - Generic 'exit' with mfe=0 is genuinely unknown — score at baseline.
+    - With MFE available, ceiling capture ratio drives the score.
+    """
     mfe = trade.get("mfe_pct", 0.0)
     mae = trade.get("mae_pct", 0.0)
     pnl = trade.get("pnl_pct", 0.0)
     exit_reason = trade.get("exit_reason", "unknown")
 
+    # MFE-aware scoring (strongest signal when we have it)
     if mfe > 0 and pnl >= mfe * 0.85:
         return 0.90
     if mfe > 0 and pnl >= mfe * 0.50:
         return 0.75
+    if mfe > 0 and pnl < mfe * 0.25:
+        return 0.40
+    # Default when mfe > 0 but no other match applies
+    if mfe > 0:
+        return 0.70
+
+    # MFE unavailable (mfe == 0). Score based on known exit reason.
     if exit_reason == "take_profit":
+        # We know we captured the ceiling target — high quality even without MFE
         return 0.65
+    if exit_reason == "stop_loss":
+        # MAE for stop-loss: abs(mae) > 0 means we tracked excursion; use it
+        if abs(mae) > 0 and abs(mae) < abs(pnl):
+            return 0.55  # MAE confirms loss was smaller than actual — stopped in time
+        if abs(mae) > 0 and abs(mae) > abs(pnl) * 1.2:
+            return 0.30  # MAE confirms we stopped unnecessarily
+        return 0.50     # MAE unavailable — give benefit of the doubt
     if exit_reason == "early_exit_1h_rsi" and pnl >= 0:
         return 0.55
     if exit_reason == "early_exit_1h_rsi" and pnl < 0:
         return 0.45
-    if exit_reason == "stop_loss" and abs(mae) < abs(pnl):
-        return 0.55
-    if exit_reason == "stop_loss" and abs(mae) > abs(pnl) * 1.2:
-        return 0.30
-    if mfe == 0:
+    if exit_reason == "exit":
+        # Generic exit with no MFE — genuinely unknown quality
         return 0.50
-    if mfe > 0 and pnl < mfe * 0.25:
-        return 0.40
-    return 0.70
+    return 0.50  # any other reason — default to baseline
 
 
 # ------------------------------------------------------------------

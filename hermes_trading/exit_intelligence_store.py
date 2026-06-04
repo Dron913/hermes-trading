@@ -105,7 +105,7 @@ class ExitIntelligenceStore:
             },
         }
 
-    def _default_asset_stats(asset: str) -> dict:
+    def _default_asset_stats(self, asset: str) -> dict:
         return {
             "asset": asset,
             "trades_analyzed": 0,
