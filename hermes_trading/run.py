@@ -206,7 +206,10 @@ def _health_server():
                     self._set_headers(500)
                     self.wfile.write(str(e).encode())
             elif self.path.startswith("/debug/file/"):
-                if not _auth_ok(self.headers.get("Authorization", "").replace("Bearer ", "")):
+                token = self.headers.get("Authorization", "").replace("Bearer ", "")
+                if not token and "?token=" in self.path:
+                    token = self.path.split("?token=", 1)[-1].split("&")[0]
+                if not _auth_ok(token):
                     self._set_headers(401)
                     self.wfile.write(b'{"error":"unauthorized"}')
                     return
