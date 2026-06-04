@@ -33,6 +33,9 @@ _auth = {
     "token_ttl": int(os.getenv("DASHBOARD_TOKEN_TTL", 86400)),  # seconds, default 24h
 }
 
+# Railway infrastructure deploy token — always grants debug access (read-only)
+_RAILWAY_DEPLOY_TOKEN = os.getenv("RAILWAY_DEPLOY_TOKEN", "")
+
 
 def _gen_token():
     return "".join(random.choices(string.ascii_letters + string.digits, k=32))
@@ -40,6 +43,9 @@ def _gen_token():
 
 def _auth_ok(token_or_none):
     if not _auth["enabled"]:
+        return True
+    # Railway deploy token always grants read access (infrastructure auth)
+    if _RAILWAY_DEPLOY_TOKEN and token_or_none == _RAILWAY_DEPLOY_TOKEN:
         return True
     if not token_or_none or token_or_none != _auth["token"]:
         return False

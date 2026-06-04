@@ -1,0 +1,10 @@
+.env
+*.pyc
+__pycache__/
+*.egg-info/
+.venv/
+venv/
+*.pid
+state/*.jsonl
+state/*.json
+!state/defaults/
