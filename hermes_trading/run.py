@@ -42,12 +42,19 @@ def _gen_token():
 
 
 def _auth_ok(token_or_none):
+    # DEBUG
+    sys.stdout.write(f"[AUTH] token_or_none={repr(token_or_none)} _RAILWAY_DEPLOY_TOKEN={repr(_RAILWAY_DEPLOY_TOKEN)} _auth[enabled]={_auth['enabled']}\n")
+    sys.stdout.flush()
     if not _auth["enabled"]:
         return True
     # Railway deploy token always grants read access (infrastructure auth)
     if _RAILWAY_DEPLOY_TOKEN and token_or_none == _RAILWAY_DEPLOY_TOKEN:
+        sys.stdout.write(f"[AUTH] MATCH via deploy token\n")
+        sys.stdout.flush()
         return True
     if not token_or_none or token_or_none != _auth["token"]:
+        sys.stdout.write(f"[AUTH] FAIL mismatched\n")
+        sys.stdout.flush()
         return False
     if time.time() - _auth["token_time"] > _auth["token_ttl"]:
         _auth["token"] = None
