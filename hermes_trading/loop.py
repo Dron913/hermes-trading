@@ -83,6 +83,9 @@ class TradingLoop:
         self._positions: dict[str, dict] = {}
         self.exchange = ccxt.kraken({"enableRateLimit": True})
         self._status_writer = StatusWriter(self.status_path)
+        # Exit Intelligence — initialized lazily at first trade close
+        self._ei_analyzer = None
+        self._ei_root = Path(__file__).parent.parent / "state"
 
     @property
     def _position_open(self) -> bool:
@@ -240,6 +243,38 @@ class TradingLoop:
             h1 = tf_data["1h"]
             await self.open_trade(asset, side, h1["close"], tf_data, q_scores)
 
+        # --- Exit Intelligence: Phase 2 advisor + Phase 3 shadow (after entries open) ---
+        if self._ei_analyzer is not None:
+            try:
+                from .exit_intelligence_store import ExitIntelligenceStore
+                store = ExitIntelligenceStore(self._ei_root)
+                state = store.get_phase_state()
+                phase = state.get("current_phase", 1)
+                trades = self._read_trades()
+                asset_stats = store.get_asset_stats()
+
+                if phase >= 2 and self._positions:
+                    recs = self._ei_analyzer.evaluate_open_positions(
+                        self._positions, trades, asset_stats
+                    )
+                    if recs:
+                        console.print(
+                            f"[cyan]Exit Intel Phase {phase}: "
+                            f"{len(recs)} recommendation(s) generated[/cyan]"
+                        )
+
+                if phase >= 3 and self._positions:
+                    shadows = self._ei_analyzer.evaluate_shadow_exits(
+                        self._positions, trades, asset_stats
+                    )
+                    if shadows:
+                        console.print(
+                            f"[magenta]Exit Intel Shadow: "
+                            f"{len(shadows)} shadow exit(s) tracked[/magenta]"
+                        )
+            except Exception as ei_err:
+                console.print(f"[yellow]Exit Intel advisor/shadow error: {ei_err}[/yellow]")
+
         # --- E2E checkpoint ---
         sv = strategy.get("version", "unknown")
         tcount = len(self._read_trades())
@@ -331,6 +366,15 @@ class TradingLoop:
         line = json.dumps(trade) + "\n"
         with self.trades_path.open("a") as f:
             f.write(line)
+
+        # --- Exit Intelligence: score and analyze this trade ---
+        try:
+            if self._ei_analyzer is None:
+                from .exit_intelligence import ExitIntelligenceAnalyzer
+                self._ei_analyzer = ExitIntelligenceAnalyzer(self._ei_root)
+            await self._ei_analyzer.on_trade_closed(trade)
+        except Exception as ei_err:
+            console.print(f"[yellow]Exit Intelligence error: {ei_err}[/yellow]")
 
         console.print(
             f"[green]CLOSE {side.upper()} {close_price:.4f} {asset} "
@@ -468,6 +512,18 @@ class TradingLoop:
 
         # Enumerate persisted state from volume — proves persistence survived restart
         state_dir = Path(__file__).parent.parent / "state"
+        self._ei_root = state_dir
+
+        # --- Exit Intelligence: backfill historical trades ---
+        try:
+            from .exit_intelligence import backfill_historical_trades
+            from .exit_intelligence_store import ExitIntelligenceStore
+            backfilled = await backfill_historical_trades(state_dir, trades)
+            sys.stdout.write(f"[EXIT INTEL] Backfill complete: {backfilled} historical trades processed\n")
+        except Exception as ei_err:
+            sys.stdout.write(f"[EXIT INTEL] Backfill skipped: {ei_err}\n")
+        sys.stdout.flush()
+
         try:
             state_files = sorted([
                 str(p.relative_to(state_dir)) for p in state_dir.rglob("*")

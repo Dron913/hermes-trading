@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from datetime import datetime, timezone
 import json
 import os
 import random
@@ -126,6 +127,8 @@ STATE_FILES = [
     "trades.jsonl", "strategy.yaml", "goal.yaml", "hypotheses.jsonl",
     "events.jsonl", "status.json", "heartbeat.json", "bootstrap_proof.json",
     "hermes_check.json", "self_learning_proof.json", "knowledge.jsonl",
+    "exit_intelligence.jsonl", "phase_state.json", "asset_exit_stats.json",
+    "recommendations.jsonl", "shadow_trades.jsonl",
 ] if os.getenv("STATE_DIR") else []
 _STATE_ROOT = Path(os.getenv("STATE_DIR", str(Path(__file__).parent.parent) + "/state"))
 
@@ -209,6 +212,184 @@ def _health_server():
                 else:
                     self._set_headers(404)
                     self.wfile.write(b"not found")
+            elif self.path.startswith("/debug/hermes-test"):
+                # Debug: direct GPT-OSS-120B NIM API call + hermes CLI fallback
+                token = self.path.split("?token=", 1)[-1].split("&")[0] if "?token=" in self.path else None
+                if _auth["enabled"] and not _auth_ok(token):
+                    self._set_headers(401)
+                    self.wfile.write(b'{"error":"unauthorized"}')
+                    return
+                try:
+                    hermes_path = shutil.which("hermes")
+                    state_root = Path(os.getenv("STATE_DIR", "/app/state"))
+                    trades_path = state_root / "trades.jsonl"
+                    strategy_path = state_root / "strategy.yaml"
+                    trades = []
+                    if trades_path.exists():
+                        for line in trades_path.read_text().strip().split("\n"):
+                            if line.strip():
+                                try: trades.append(json.loads(line))
+                                except: pass
+                    recent = trades[-25:]
+
+                    import yaml as _yaml, sys as _sys, urllib.request as _ur
+                    _sys.path.insert(0, str(Path(__file__).parent))
+                    from reflect import build_hermes_prompt, parse_hermes_output
+
+                    strategy = _yaml.safe_load(strategy_path.read_text())
+                    prompt = build_hermes_prompt(recent, strategy, include_knowledge=False)
+
+                    # === Direct NIM API call (fast, primary path) ===
+                    api_key = os.getenv("NIM_API_KEY") or os.getenv("NVIDIA_API_KEY") or ""
+                    system_prompt = """You are Hermes, a sophisticated self-improving crypto trading strategy AI.
+Always respond with ONLY a valid JSON object, no markdown, no explanation.
+
+Output format: {"variable": "strategy.path", "direction": "loosen|tighten|increase|decrease",
+ "amount": number, "reason": "explanation under 80 chars"}"""
+                    nim_payload = {
+                        "model": "openai/gpt-oss-120b",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": "Analyze this trading data and suggest one improvement.\n\n" + prompt}
+                        ],
+                        "max_tokens": 400,
+                        "temperature": 0.3
+                    }
+                    direct_result = None
+                    direct_raw = ""
+                    try:
+                        req = _ur.Request(
+                            "https://integrate.api.nvidia.com/v1/chat/completions",
+                            data=json.dumps(nim_payload).encode(),
+                            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                            method="POST"
+                        )
+                        with _ur.urlopen(req, timeout=120) as resp:
+                            direct_result = json.loads(resp.read())
+                        direct_raw = direct_result["choices"][0]["message"]["content"].strip()
+                    except Exception as e:
+                        direct_raw = f"[NIM API error: {e}]"
+
+                    direct_parsed = parse_hermes_output(direct_raw)
+                    direct_success = "Hermes parse failed" not in direct_parsed.get("reason", "")
+
+                    # === Hermes CLI fallback (slower path) ===
+                    cli_raw = ""
+                    cli_stderr = ""
+                    if hermes_path:
+                        try:
+                            proc = __import__("subprocess").run(
+                                [hermes_path, "-z", prompt],
+                                capture_output=True, timeout=720
+                            )
+                            cli_raw = proc.stdout.decode("utf-8", errors="replace")
+                            cli_stderr = proc.stderr.decode("utf-8", errors="replace")
+                        except BaseException as e:
+                            cli_raw = f"[EXC {type(e).__name__}] {e}"
+
+                    response = {
+                        "model": "openai/gpt-oss-120b",
+                        "hermes_path": hermes_path or None,
+                        "trades_analyzed": len(recent),
+                        "direct_nim": {
+                            "api_call_ok": direct_result is not None,
+                            "raw_output": direct_raw[:2000],
+                            "parsed": direct_parsed,
+                            "parse_success": direct_success,
+                        },
+                        "hermes_cli": {
+                            "attempted": hermes_path is not None,
+                            "raw_stdout": cli_raw[:2000],
+                            "raw_stderr": cli_stderr[:500],
+                        },
+                    }
+                    self._set_headers(200)
+                    self.wfile.write(json.dumps(response, indent=2).encode())
+                except Exception as e:
+                    self._set_headers(500)
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
+            elif self.path.startswith("/debug/exit-intelligence"):
+                # Exit Intelligence: phase state, progress, stats, Phase 4 controls
+                token = self.path.split("?token=", 1)[-1].split("&")[0] if "?" in self.path else None
+                if _auth["enabled"] and not _auth_ok(token):
+                    self._set_headers(401); self.wfile.write(b'{"error":"unauthorized"}'); return
+                try:
+                    state_root = Path(os.getenv("STATE_DIR", "/app/state"))
+                    ei_data = {}
+                    ei_data["phase_state"] = json.loads((state_root / "phase_state.json").read_text())
+                    ei_data["asset_stats"] = json.loads((state_root / "asset_exit_stats.json").read_text())
+
+                    # Load recent exit intelligence records
+                    ei_path = state_root / "exit_intelligence.jsonl"
+                    recent_ei = []
+                    if ei_path.exists():
+                        for line in reversed(ei_path.read_text(encoding="utf-8").strip().splitlines()):
+                            if not line.strip(): continue
+                            try:
+                                r = json.loads(line)
+                                recent_ei.append(r)
+                                if len(recent_ei) >= 10: break
+                            except json.JSONDecodeError: pass
+                    ei_data["recent_exit_records"] = recent_ei
+
+                    # Recommendations (if phase >= 2)
+                    recs_path = state_root / "recommendations.jsonl"
+                    recent_recs = []
+                    if recs_path.exists():
+                        for line in reversed(recs_path.read_text(encoding="utf-8").strip().splitlines()):
+                            if not line.strip(): continue
+                            try:
+                                r = json.loads(line)
+                                recent_recs.append(r)
+                                if len(recent_recs) >= 10: break
+                            except json.JSONDecodeError: pass
+                    ei_data["recent_recommendations"] = recent_recs
+
+                    # Shadow performance summary (if phase >= 3)
+                    from .exit_intelligence_store import ExitIntelligenceStore
+                    store = ExitIntelligenceStore(state_root)
+                    ei_data["shadow_performance"] = store.load_shadow_performance_summary()
+
+                    # Active Phase 4 proposal (if any)
+                    ei_data["active_proposal"] = store.load_active_proposal()
+
+                    # Compute gateway status
+                    ps = ei_data["phase_state"]
+                    to2 = ps.get("phase1", {}).get("to_phase_2", {})
+                    to3 = ps.get("phase2", {}).get("to_phase_3", {})
+                    to4 = ps.get("phase3", {}).get("to_phase_4", {})
+                    p4_approved = ps.get("phase4", {}).get("approved", False)
+
+                    ei_data["gateway_status"] = {
+                        "current_phase": ps.get("current_phase", 1),
+                        "phase_4_approved": p4_approved,
+                        "to_phase_2": {
+                            "met": all([to2.get("trades_met"), to2.get("quality_met"), to2.get("observations_met")]),
+                            "trades": {"current": ps.get("phase1", {}).get("total_trades_analyzed", 0), "required": 50},
+                            "quality": {"current": to2.get("current_quality", 0), "required": 0.55, "met": to2.get("quality_met", False)},
+                            "observations": {"met": to2.get("observations_met", False)},
+                        },
+                        "to_phase_3": {
+                            "met": all([to3.get("rec_count_met"), to3.get("accuracy_met"), to3.get("multi_asset_met")]),
+                            "rec_count": {"current": ps.get("phase2", {}).get("recommendations_made", 0), "required": 50},
+                            "accuracy": {"current": ps.get("phase2", {}).get("accuracy_rate", 0), "required": 0.60, "met": to3.get("accuracy_met", False)},
+                            "multi_asset": {"current": len(ps.get("phase2", {}).get("assets_with_recommendations", [])), "required": 2, "met": to3.get("multi_asset_met", False)},
+                        },
+                        "to_phase_4": {
+                            "met": all([to4.get("rec_count_met"), to4.get("accuracy_met"), to4.get("shadow_improvement_met"), to4.get("multi_asset_met")]),
+                            "rec_count": {"current": ps.get("phase3", {}).get("shadow_trades_evaluated", 0), "required": 20},
+                            "shadow_win_rate_delta": {"current": (ps.get("phase3", {}).get("shadow_win_rate", 0) - ps.get("phase3", {}).get("actual_win_rate", 0)), "required": 5.0, "met": to4.get("accuracy_met", False)},
+                            "pnl_delta": {"current": ps.get("phase3", {}).get("shadow_vs_actual_pnl_delta", 0), "required": 0.5, "met": to4.get("shadow_improvement_met", False)},
+                            "multi_asset": {"current": len(ps.get("phase3", {}).get("assets_proven", [])), "required": 3, "met": to4.get("multi_asset_met", False)},
+                            "note_manual_only": "Phase 4 NEVER activates automatically — requires human approval",
+                        },
+                    }
+
+                    self._set_headers(200)
+                    self.wfile.write(json.dumps(ei_data, indent=2).encode())
+                except Exception as e:
+                    self._set_headers(500)
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
             else:
                 self._set_headers(200)
                 self.wfile.write(b"OK")
@@ -257,6 +438,68 @@ def _health_server():
                 except Exception as e:
                     self._set_headers(500)
                     self.wfile.write(str(e).encode())
+            elif self.path.startswith("/debug/exit-intelligence/phase4-disable"):
+                # Disable Phase 4 — always available
+                token = self.path.split("?token=", 1)[-1].split("&")[0] if "?" in self.path else None
+                if _auth["enabled"] and not _auth_ok(token):
+                    self._set_headers(401); self.wfile.write(b'{"error":"unauthorized"}'); return
+                try:
+                    state_root = Path(os.getenv("STATE_DIR", "/app/state"))
+                    from .exit_intelligence_store import ExitIntelligenceStore
+                    store = ExitIntelligenceStore(state_root)
+                    state = store.get_phase_state()
+                    state["phase_4_locked"] = True
+                    state["phase4"]["approved"] = False
+                    state["phase4"]["approved_at"] = None
+                    state["phase_4_locked_by_user"] = True
+                    state["last_updated"] = datetime.now(timezone.utc).isoformat()
+                    store.update_phase_state(state)
+                    self._set_headers(200)
+                    self.wfile.write(json.dumps({"ok": True, "phase4_enabled": False, "message": "Phase 4 disabled"}))
+                except Exception as e:
+                    self._set_headers(500)
+                    self.wfile.write(json.dumps({"error": str(e)}))
+            elif self.path.startswith("/debug/exit-intelligence/phase4-approve"):
+                # Approve Phase 4 — requires proposal ready
+                token = self.path.split("?token=", 1)[-1].split("&")[0] if "?" in self.path else None
+                if _auth["enabled"] and not _auth_ok(token):
+                    self._set_headers(401); self.wfile.write(b'{"error":"unauthorized"}'); return
+                try:
+                    state_root = Path(os.getenv("STATE_DIR", "/app/state"))
+                    from .exit_intelligence_store import ExitIntelligenceStore
+                    store = ExitIntelligenceStore(state_root)
+                    state = store.get_phase_state()
+                    to4 = state.get("phase3", {}).get("to_phase_4", {})
+                    if not all([to4.get("rec_count_met"), to4.get("accuracy_met"),
+                               to4.get("shadow_improvement_met"), to4.get("multi_asset_met")]):
+                        self._set_headers(400)
+                        self.wfile.write(json.dumps({
+                            "error": "Phase 4 requirements not met",
+                            "rec_count_met": to4.get("rec_count_met", False),
+                            "accuracy_met": to4.get("accuracy_met", False),
+                            "shadow_improvement_met": to4.get("shadow_improvement_met", False),
+                            "multi_asset_met": to4.get("multi_asset_met", False),
+                        }))
+                    else:
+                        proposal = store.load_active_proposal()
+                        if proposal:
+                            store.approve_proposal(proposal["proposal_id"])
+                        state["phase_4_locked"] = False
+                        state["phase4"]["approved"] = True
+                        state["phase4"]["approved_at"] = datetime.now(timezone.utc).isoformat()
+                        state["last_updated"] = datetime.now(timezone.utc).isoformat()
+                        (state_root / "phase_state.json").write_text(json.dumps(state, indent=2))
+                        self._set_headers(200)
+                        self.wfile.write(json.dumps({
+                            "ok": True,
+                            "phase4_enabled": True,
+                            "proposal_id": proposal.get("proposal_id") if proposal else None,
+                            "message": "Phase 4 approved — Hermes may now generate exit proposals. "
+                                      "All proposals require human review before action.",
+                        }))
+                except Exception as e:
+                    self._set_headers(500)
+                    self.wfile.write(json.dumps({"error": str(e)}))
             else:
                 self._set_headers(404)
                 self.wfile.write(b"not found")

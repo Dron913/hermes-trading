@@ -468,25 +468,63 @@ def _build_trade_listing(trades: List[dict], limit: int = 10) -> str:
 
 
 async def run_hermes_reflection(trades: List[dict], strategy_path: Path, trades_path: Path, hypotheses_path: Path) -> dict:
-    """Hermes mode: calls the `hermes` CLI with trade data, parses the hypothesis."""
+    """Hermes mode: calls the `hermes` CLI with trade data, parses the hypothesis.
+    Tries hermes CLI first, falls back to direct NIM API call if CLI fails."""
     import subprocess
+    import urllib.request as _ur
     strategy = yaml.safe_load(strategy_path.read_text())
     prev_version = strategy["version"]
     state_dir = Path(__file__).parent.parent / "state"
 
-    # Load knowledge storage and derive insights from trades
     storage = KnowledgeStorage(state_dir)
     for trade in trades:
         derive_knowledge_from_trade(trade, storage)
 
     prompt = build_hermes_prompt(trades, strategy, storage, include_knowledge=True)
-    result = subprocess.run(
-        ["hermes", "-z", prompt],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    output = result.stdout + result.stderr
+    output = ""
+
+    # Attempt hermes CLI first (primary path)
+    try:
+        result = subprocess.run(
+            ["hermes", "-z", prompt],
+            capture_output=True, timeout=720,
+        )
+        output = result.stdout.decode("utf-8", errors="replace") + result.stderr.decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"[YELLOW]Hermes CLI failed ({type(e).__name__}): {e} — trying direct NIM API[/YELLOW]")
+
+    # Fall back to direct NIM API call if hermes CLI produced no useful output
+    if not output.strip() or "Hermes parse failed" in output:
+        api_key = os.getenv("NIM_API_KEY") or os.getenv("NVIDIA_API_KEY") or ""
+        system_prompt = (
+            "You are Hermes, a sophisticated self-improving crypto trading strategy AI.\n"
+            "Always respond with ONLY a valid JSON object, no markdown, no explanation.\n\n"
+            "Output: {\"variable\": \"strategy.path\", \"direction\": \"loosen|tighten|increase|decrease\", "
+            "\"amount\": number, \"reason\": \"explanation under 80 chars\"}"
+        )
+        payload = {
+            "model": "openai/gpt-oss-120b",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Analyze this trading data and suggest one improvement.\n\n" + prompt}
+            ],
+            "max_tokens": 400, "temperature": 0.3
+        }
+        try:
+            req = _ur.Request(
+                "https://integrate.api.nvidia.com/v1/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                method="POST"
+            )
+            with _ur.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read())
+            output = result["choices"][0]["message"]["content"].strip()
+            print(f"[CYAN]Hermes (direct NIM) raw output: {output[:100]}[/CYAN]")
+        except Exception as e:
+            print(f"[RED]Direct NIM API also failed: {e}[/RED]")
+            output = ""
+
     hypothesis = parse_hermes_output(output)
     new_version = apply_hypothesis(hypothesis, strategy_path, hypotheses_path, _hermes_context(), len(trades), trades)
     print(f"[CYAN]Hermes reflection [{prev_version} -> {new_version}]: "
@@ -535,6 +573,14 @@ def build_hermes_prompt(trades: List[dict], strategy: dict, storage: Optional[Kn
     if include_knowledge and storage:
         knowledge_note = build_knowledge_context(storage, recent)
 
+    # Only render KNOWLEDGE DOMAINS section when storage is available
+    knowledge_domains_note = ""
+    if storage:
+        domain_list = ", ".join(
+            d for d in KNOWLEDGE_DOMAINS if storage.domains.get(d, {}).get("count", 0) > 0
+        ) or "none yet"
+        knowledge_domains_note = f"\n\n== KNOWLEDGE DOMAINS ==\nCovered domains: {storage.get_domain_diversity()}/{len(KNOWLEDGE_DOMAINS)} ({domain_list})"
+
     return f"""Trading Strategy Advisor — analyze closed trades and propose one improvement.
 
 OUTPUT FORMAT (JSON only, no additional text):
@@ -560,8 +606,7 @@ Total trades in analysis window: {len(recent)}
   Asset PnL breakdown:    {stats.get('asset_performance', {})}
   Exit reason breakdown:  {stats.get('exit_reason_breakdown', {})}
 
-== KNOWLEDGE DOMAINS ==
-Covered domains: {storage.get_domain_diversity()}/{len(KNOWLEDGE_DOMAINS)} ({', '.join(d for d in KNOWLEDGE_DOMAINS if storage.domains.get(d, {}).get('count', 0) > 0) or 'none yet'}){knowledge_note}
+{knowledge_domains_note}
 {hypotheses_note}
 
 == YOUR TASK ==
@@ -576,31 +621,36 @@ Output only the JSON object."""
 
 def parse_hermes_output(output: str) -> dict:
     """Extract JSON from LLM output using robust character-by-character scanning.
-    Handles embedded braces, multi-line strings, and various output formats.
+    Handles markdown code fences, embedded braces, multi-line strings, and various output formats.
     Falls back to default only after exhausting all parsing attempts."""
     import re, json as _json
 
-    # Try greedy JSON extraction first — handles most common cases
-    # Find all complete JSON objects in the output
-    objects = _extract_all_json_objects(output)
-    if objects:
-        for obj in objects:
-            result = _try_parse_hermes_json(obj)
-            if result:
-                return result
+    # Strip markdown code fences first
+    cleaned = output
+    for fence_pattern in (r'^```json\s*\n', r'^```\s*\n', r'\n```json\s*$', r'\n```\s*$', r'^```$'):
+        cleaned = re.sub(fence_pattern, '', cleaned, flags=re.MULTILINE).strip()
+
+    # Try on both cleaned and original
+    for text in (cleaned, output):
+        objects = _extract_all_json_objects(text)
+        if objects:
+            for obj in objects:
+                result = _try_parse_hermes_json(obj)
+                if result:
+                    return result
 
     # Try regex extraction as fallback
-    patterns = [
-        r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}',           # Single-nested braces
-        r'\{[\s\S]*?\}',                               # Lazy (minimal) match
-        r'\{.*\}',                                     # Greedy (may over-match)
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, output, re.DOTALL)
-        if m:
-            result = _try_parse_hermes_json(m.group())
-            if result:
-                return result
+    for text in (cleaned, output):
+        patterns = [
+            r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}',           # Single-nested braces
+            r'\{[\s\S]*?"\w+"\s*:',                       # JSON with property (lazy)
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text, re.DOTALL)
+            if m:
+                result = _try_parse_hermes_json(m.group())
+                if result:
+                    return result
 
     # All parsing attempts failed — return default fallback
     return {"variable": "entry.rsi_threshold", "direction": "loosen", "amount": 2,
