@@ -42,19 +42,12 @@ def _gen_token():
 
 
 def _auth_ok(token_or_none):
-    # DEBUG
-    sys.stderr.write(f"[AUTH] t={repr(token_or_none)} deploy={repr(_RAILWAY_DEPLOY_TOKEN)} enabled={_auth['enabled']}\n")
-    sys.stderr.flush()
     if not _auth["enabled"]:
         return True
     # Railway deploy token always grants read access (infrastructure auth)
     if _RAILWAY_DEPLOY_TOKEN and token_or_none == _RAILWAY_DEPLOY_TOKEN:
-        sys.stderr.write(f"[AUTH] MATCH\n")
-        sys.stderr.flush()
         return True
     if not token_or_none or token_or_none != _auth["token"]:
-        sys.stderr.write(f"[AUTH] FAIL mismatch\n")
-        sys.stderr.flush()
         return False
     if time.time() - _auth["token_time"] > _auth["token_ttl"]:
         _auth["token"] = None
@@ -213,8 +206,6 @@ def _health_server():
                     self._set_headers(500)
                     self.wfile.write(str(e).encode())
             elif self.path.startswith("/debug/file/"):
-                sys.stdout.write(f"[FILE] path={self.path}\n")
-                sys.stdout.flush()
                 token = self.headers.get("Authorization", "").replace("Bearer ", "")
                 if not token and "?token=" in self.path:
                     token = self.path.split("?token=", 1)[-1].split("&")[0]
