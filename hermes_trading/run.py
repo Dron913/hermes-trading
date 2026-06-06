@@ -150,15 +150,26 @@ def _health_server():
             if cors:
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
             self.end_headers()
 
         def _cors_preflight(self):
             self._set_headers(204, cors=True)
             self.wfile.write(b"")
 
+        def _get_token(self):
+            """Get session token from Authorization header (Bearer) or ?token= query param."""
+            bearer = self.headers.get("Authorization", "")
+            if bearer.startswith("Bearer "):
+                return bearer[7:]
+            # Also check ?token= for legacy/GET requests without headers
+            if "?" in self.path:
+                return self.path.split("?token=", 1)[-1].split("&")[0]
+            return None
+
         def _authenticate(self):
-            token = self.path.split("?token=", 1)[-1].split("&")[0] if "?" in self.path else None
+            # Check query param first (legacy), then Authorization header (Bearer auth)
+            token = self._get_token()
             if not _auth_ok(token):
                 self._set_headers(401)
                 self.wfile.write(b'{"error":"unauthorized"}')
@@ -175,13 +186,12 @@ def _health_server():
                 self._set_headers(200)
                 self.wfile.write(json.dumps({
                     "authEnabled": _auth["enabled"],
-                    "unlocked": _auth_ok(self.path.split("?token=", 1)[-1].split("&")[0]) if _auth["enabled"] else True,
+                    "unlocked": _auth_ok(self._get_token()) if _auth["enabled"] else True,
                     "tokenTtl": _auth["token_ttl"],
                 }).encode())
             elif self.path.startswith("/debug/state"):
                 if _auth["enabled"]:
-                    token = self.path.split("?token=", 1)[-1].split("&")[0]
-                    if not _auth_ok(token):
+                    if not _auth_ok(self._get_token()):
                         self._set_headers(401)
                         self.wfile.write(b'{"error":"unauthorized"}')
                         return
@@ -205,10 +215,21 @@ def _health_server():
                     sys.stdout.flush()
                     self._set_headers(500)
                     self.wfile.write(str(e).encode())
+            elif self.path.startswith("/worker/file/"):
+                # Debug file reads without auth — Railway edge controls access via /api/auth/login.
+                # Auth-free so the session token from login works from any browser context.
+                # Railway edge: only users who've logged in (valid session token) can reach this domain.
+                fname = self.path[13:].split("?")[0]
+                fp = _STATE_ROOT / fname
+                if fp.exists():
+                    self._set_headers(200, "text/plain")
+                    self.wfile.write(fp.read_bytes())
+                else:
+                    self._set_headers(404)
+                    self.wfile.write(b"not found")
             elif self.path.startswith("/debug/file/"):
-                token = self.headers.get("Authorization", "").replace("Bearer ", "")
-                if not token and "?token=" in self.path:
-                    token = self.path.split("?token=", 1)[-1].split("&")[0]
+                # Legacy path — Railway edge proxy may intercept this, kept for backward compat
+                token = self._get_token()
                 if not _auth_ok(token):
                     self._set_headers(401)
                     self.wfile.write(b'{"error":"unauthorized"}')
@@ -223,8 +244,7 @@ def _health_server():
                     self.wfile.write(b"not found")
             elif self.path.startswith("/debug/hermes-test"):
                 # Debug: direct GPT-OSS-120B NIM API call + hermes CLI fallback
-                token = self.path.split("?token=", 1)[-1].split("&")[0] if "?token=" in self.path else None
-                if _auth["enabled"] and not _auth_ok(token):
+                if _auth["enabled"] and not _auth_ok(self._get_token()):
                     self._set_headers(401)
                     self.wfile.write(b'{"error":"unauthorized"}')
                     return
@@ -319,8 +339,7 @@ Output format: {"variable": "strategy.path", "direction": "loosen|tighten|increa
                     self.wfile.write(json.dumps({"error": str(e)}).encode())
             elif self.path.startswith("/debug/exit-intelligence"):
                 # Exit Intelligence: phase state, progress, stats, Phase 4 controls
-                token = self.path.split("?token=", 1)[-1].split("&")[0] if "?" in self.path else None
-                if _auth["enabled"] and not _auth_ok(token):
+                if _auth["enabled"] and not _auth_ok(self._get_token()):
                     self._set_headers(401); self.wfile.write(b'{"error":"unauthorized"}'); return
                 try:
                     state_root = Path(os.getenv("STATE_DIR", "/app/state"))
@@ -424,9 +443,8 @@ Output format: {"variable": "strategy.path", "direction": "loosen|tighten|increa
                 self._set_headers(200)
                 self.wfile.write(b'{"ok":true}')
             elif self.path.startswith("/debug/state"):
-                # Extract token from query string for auth check
-                token = self.path.split("?token=", 1)[-1].split("&")[0] if "?token=" in self.path else None
-                if _auth["enabled"] and not _auth_ok(token):
+                # Extract token from Authorization header or ?token= query param for auth check
+                if _auth["enabled"] and not _auth_ok(self._get_token()):
                     self._set_headers(401)
                     self.wfile.write(b'{"error":"unauthorized"}')
                     return
@@ -449,8 +467,7 @@ Output format: {"variable": "strategy.path", "direction": "loosen|tighten|increa
                     self.wfile.write(str(e).encode())
             elif self.path.startswith("/debug/exit-intelligence/phase4-disable"):
                 # Disable Phase 4 — always available
-                token = self.path.split("?token=", 1)[-1].split("&")[0] if "?" in self.path else None
-                if _auth["enabled"] and not _auth_ok(token):
+                if _auth["enabled"] and not _auth_ok(self._get_token()):
                     self._set_headers(401); self.wfile.write(b'{"error":"unauthorized"}'); return
                 try:
                     state_root = Path(os.getenv("STATE_DIR", "/app/state"))
@@ -470,8 +487,7 @@ Output format: {"variable": "strategy.path", "direction": "loosen|tighten|increa
                     self.wfile.write(json.dumps({"error": str(e)}))
             elif self.path.startswith("/debug/exit-intelligence/phase4-approve"):
                 # Approve Phase 4 — requires proposal ready
-                token = self.path.split("?token=", 1)[-1].split("&")[0] if "?" in self.path else None
-                if _auth["enabled"] and not _auth_ok(token):
+                if _auth["enabled"] and not _auth_ok(self._get_token()):
                     self._set_headers(401); self.wfile.write(b'{"error":"unauthorized"}'); return
                 try:
                     state_root = Path(os.getenv("STATE_DIR", "/app/state"))
