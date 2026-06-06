@@ -20,7 +20,24 @@ from .adapters.macro import fetch_macro
 from .score import score_trades
 
 
+# Use STATE_DIR env var so loop.py writes to the same volume as run.py reads from.
+# Railway mounts its persistent volume at /app/state — use that as default.
+# When STATE_DIR is set (e.g., in local dev), use that path; otherwise prefer /app/state
+# over the relative-to-__file__ path so all Railway components write to the shared volume.
+_env = os.getenv("STATE_DIR", "")
+if _env:
+    _STATE_DIR = Path(_env)
+else:
+    # Default to /app/state (Railway persistent volume) so loop.py writes to the same
+    # location that run.py /worker/file/ reads from. Fall back to /app/hermes_trading/state
+    # only if the container is running without a persistent volume mount.
+    _STATE_DIR = Path("/app/state")
+
 console = Console()
+
+# Expose for StatusWorker._pa_path and other components that need the same root
+def get_state_dir() -> Path:
+    return _STATE_DIR
 
 
 class StatusWriter:
@@ -128,11 +145,12 @@ class TradingLoop:
         self.asset = asset
         self.goal = goal
         self.assets = goal.get("assets", [asset])
-        self.strategy_path = Path(__file__).parent.parent / "state" / "strategy.yaml"
-        self.trades_path = Path(__file__).parent.parent / "state" / "trades.jsonl"
-        self.heartbeat_path = Path(__file__).parent.parent / "state" / "heartbeat.json"
-        self.hypotheses_path = Path(__file__).parent.parent / "state" / "hypotheses.jsonl"
-        self.status_path = Path(__file__).parent.parent / "state" / "status.json"
+        sd = _STATE_DIR  # use env-aligned state directory
+        self.strategy_path = sd / "strategy.yaml"
+        self.trades_path = sd / "trades.jsonl"
+        self.heartbeat_path = sd / "heartbeat.json"
+        self.hypotheses_path = sd / "hypotheses.jsonl"
+        self.status_path = sd / "status.json"
         self.consecutive_failures = 0
         self.max_failures = 5
         # Positions dict: {signal_asset: {entry_price, entry_time, side, indicators}}
@@ -141,7 +159,7 @@ class TradingLoop:
         self._status_writer = StatusWriter(self.status_path)
         # Exit Intelligence — initialized lazily at first trade close
         self._ei_analyzer = None
-        self._ei_root = Path(__file__).parent.parent / "state"
+        self._ei_root = sd
 
     @property
     def _position_open(self) -> bool:
@@ -578,7 +596,7 @@ class TradingLoop:
         trades = self._read_trades()
 
         # Enumerate persisted state from volume — proves persistence survived restart
-        state_dir = Path(__file__).parent.parent / "state"
+        state_dir = _STATE_DIR
         self._ei_root = state_dir
 
         # --- Exit Intelligence: backfill historical trades ---

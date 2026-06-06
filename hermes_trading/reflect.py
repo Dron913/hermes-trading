@@ -1,5 +1,6 @@
 """Deterministic reflection (fallback) + Hermes-aware reflection."""
 import json
+import os
 import random
 import shutil
 import sys
@@ -10,7 +11,9 @@ from typing import List, Optional
 import yaml
 
 
-HISTORY_DIR = Path(__file__).parent.parent / "state" / "history"
+# Share STATE_DIR with loop.py so all components write to the same persistent volume.
+_STATE_DIR = Path(os.getenv("STATE_DIR", str(Path(__file__).parent.parent) + "/state"))
+HISTORY_DIR = _STATE_DIR / "history"
 HYPOTHESIS_PROMPT_VERSION = "v25trades"
 
 # ============================================================
@@ -474,7 +477,7 @@ async def run_hermes_reflection(trades: List[dict], strategy_path: Path, trades_
     import urllib.request as _ur
     strategy = yaml.safe_load(strategy_path.read_text())
     prev_version = strategy["version"]
-    state_dir = Path(__file__).parent.parent / "state"
+    state_dir = _STATE_DIR
 
     storage = KnowledgeStorage(state_dir)
     for trade in trades:
@@ -552,7 +555,7 @@ def build_hermes_prompt(trades: List[dict], strategy: dict, storage: Optional[Kn
 
     # Load previous hypotheses for context (if available on disk)
     hypotheses_note = ""
-    state_dir = Path(__file__).parent.parent / "state"
+    state_dir = _STATE_DIR
     hyp_path = state_dir / "hypotheses.jsonl"
     if hyp_path.exists():
         hyp_lines = [l.strip() for l in hyp_path.read_text().strip().split("\n") if l.strip()]
