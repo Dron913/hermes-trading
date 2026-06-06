@@ -135,8 +135,10 @@ STATE_FILES = [
     "hermes_check.json", "self_learning_proof.json", "knowledge.jsonl",
     "exit_intelligence.jsonl", "phase_state.json", "asset_exit_stats.json",
     "recommendations.jsonl", "shadow_trades.jsonl", "paper_account.yaml",
-] if os.getenv("STATE_DIR") else []
-_STATE_ROOT = Path(os.getenv("STATE_DIR", "/app/state"))  # matches run.py state_root default
+]
+# NOTE: STATE_DIR env var is intentionally NOT a gate here.
+# The env var is only used to override _STATE_ROOT for local dev.
+# In production (no STATE_DIR set), _STATE_ROOT defaults to /app/state.
 
 
 def _health_server():
