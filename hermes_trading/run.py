@@ -136,7 +136,7 @@ STATE_FILES = [
     "exit_intelligence.jsonl", "phase_state.json", "asset_exit_stats.json",
     "recommendations.jsonl", "shadow_trades.jsonl", "paper_account.yaml",
 ] if os.getenv("STATE_DIR") else []
-_STATE_ROOT = Path(os.getenv("STATE_DIR", str(Path(__file__).parent.parent) + "/state"))
+_STATE_ROOT = Path(os.getenv("STATE_DIR", "/app/state"))  # matches run.py state_root default
 
 
 def _health_server():
