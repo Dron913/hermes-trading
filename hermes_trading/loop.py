@@ -176,8 +176,18 @@ class TradingLoop:
                 console.print(f"[yellow]  Could not sync Alpaca equity: {e} — using yaml balance[/yellow]")
         else:
             console.print("[yellow]ALPACA_API_KEY/SECRET not set — running in simulation mode[/yellow]")
+        # Alpaca: sync equity BEFORE StatusWriter init so the yaml has correct balance
+        if self._broker:
+            try:
+                alpaca_equity = self._broker.get_equity()
+                yaml_path = sd / "paper_account.yaml"  # /app/state/paper_account.yaml
+                yaml.safe_dump({"starting_balance": alpaca_equity}, yaml_path.open("w"))
+                self._starting_balance = alpaca_equity  # override before StatusWriter reads it
+                console.print(f"[bold cyan]  Alpaca equity synced: ${alpaca_equity:,.2f}[/bold cyan]")
+            except Exception as e:
+                console.print(f"[yellow]  Could not sync Alpaca equity: {e}[/yellow]")
         self.exchange = ccxt.kraken({"enableRateLimit": True})
-        self._status_writer = StatusWriter(self.status_path)
+        self._status_writer = StatusWriter(self.status_path)  # now reads correct yaml
         # Exit Intelligence — initialized lazily at first trade close
         self._ei_analyzer = None
         self._ei_root = sd
