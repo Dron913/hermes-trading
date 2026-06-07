@@ -246,7 +246,7 @@ class TradingLoop:
                 for asset in closed_offline:
                     pos = self._positions[asset]
                     sys.stdout.write(
-                        f"DETECTED CLOSE: {asset} closed via Alpaca bracket "
+                        f"DETECTED CLOSE: {asset} closed via Alpaca TP/SL "
                         f"(entry={pos['entry_price']:.4f})\n"
                     )
                     sys.stdout.flush()
@@ -527,24 +527,31 @@ class TradingLoop:
             },
         }
 
-        # --- Alpaca: submit real bracket order ---
+        # --- Alpaca: submit real market + TP/SL orders ---
         if self._broker:
             _strategy = self.load_strategy()
             equity = self._broker.get_equity()
             risk_pct = _strategy.get("risk_per_trade_pct", 1.0) / 100.0
             sl_pct = _strategy.get("stop_loss_pct", 0.3) / 100.0
             tp_pct = _strategy.get("take_profit_pct", 1.8) / 100.0
-            order_id = self._broker.submit_entry(
+            order_id, filled_price = self._broker.submit_entry(
                 symbol=asset, side=side, equity=equity,
                 risk_pct=risk_pct, stop_loss_pct=sl_pct,
                 take_profit_pct=tp_pct, entry_price=price,
             )
             if order_id:
                 self._positions[asset]["_alpaca_order_id"] = order_id
-                console.print(
-                    f"[bold cyan]  Alpaca: {order_id} "
-                    f"(equity=${equity:,.0f}, risk={risk_pct*100:.1f}%)[/bold cyan]"
-                )
+                self._positions[asset]["_alpaca_filled"] = True
+                if filled_price and filled_price != price:
+                    self._positions[asset]["entry_price"] = filled_price
+                    console.print(
+                        f"[bold cyan]  Alpaca: {order_id} filled @ ${filled_price:.4f}[/bold cyan]"
+                    )
+                else:
+                    console.print(
+                        f"[bold cyan]  Alpaca: {order_id} "
+                        f"(equity=${equity:,.0f}, risk={risk_pct*100:.1f}%)[/bold cyan]"
+                    )
             else:
                 console.print(f"[bold red]  Alpaca order FAILED — stored locally[/bold red]")
         console.print(
@@ -564,14 +571,15 @@ class TradingLoop:
         strategy: dict,
         pos: dict,
     ):
-        # --- Alpaca: close position at market ---
+        # --- Alpaca: cancel any pending TP/SL, then close at market ---
         if self._broker:
             close_side = "sell" if side == "long" else "buy"
+            self._broker.cancel_open_orders(asset)
             result = self._broker.submit_market_order(asset, qty=None, side=close_side)
             if result:
                 console.print(f"[bold cyan]  Alpaca close: {result}[/bold cyan]")
             else:
-                sys.stdout.write(f"[WARN] Alpaca close order failed for {asset}\n")
+                sys.stdout.write(f"[WARN] Alpaca close order failed (may already be closed)\n")
                 sys.stdout.flush()
 
         # --- Exit Intelligence: MFE/MAE tracking ---

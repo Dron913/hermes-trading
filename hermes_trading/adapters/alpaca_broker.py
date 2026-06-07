@@ -1,5 +1,5 @@
 """Alpaca paper trading broker — real orders on Alpaca, OHLCV stays via ccxt."""
-import httpx
+import httpx, os, sys, time
 from typing import Dict, Optional
 
 
@@ -70,7 +70,7 @@ class AlpacaBroker:
             avg_entry = float(p["avg_entry_price"])
             side = p["side"]              # long or short
             current_price = float(p["current_price"])
-            upnl_pct = float(p["unrealized_pl_pc"])   # e.g. -0.0235 = -2.35%
+            upnl_pct = float(p["unrealized_plpc"])   # e.g. -0.0235 = -2.35%
             positions[kraken_sym] = {
                 "qty": qty,
                 "entry_price": avg_entry,
@@ -96,66 +96,118 @@ class AlpacaBroker:
     # -------------------------------------------------------------------------
     def submit_entry(
         self,
-        symbol: str,          # Kraken format: BTC/USDT
-        side: str,             # long or short
+        symbol: str,
+        side: str,
         equity: float,
-        risk_pct: float,       # e.g. 0.01 = 1% of equity
-        stop_loss_pct: float,  # e.g. 0.003 = 0.3%
-        take_profit_pct: float,# e.g. 0.018 = 1.8%
-        entry_price: Optional[float] = None,  # use current OHLCV close
-    ) -> Optional[str]:
+        risk_pct: float,
+        stop_loss_pct: float,
+        take_profit_pct: float,
+        entry_price: Optional[float] = None,
+    ) -> tuple[Optional[str], Optional[float]]:
         """
-        Submit a bracket order: market entry + OCO stop-loss + take-profit.
-        Returns order_id or None on failure.
+        Submit market entry + separate TP/SL orders.
+        Returns (entry_order_id, filled_price) or (None, None).
+        Crypto does NOT support bracket orders — we submit as separate orders.
         """
         alpaca_sym = KRKEN_TO_ALPACA.get(symbol, symbol)
         if entry_price is None:
             entry_price = self.get_current_price(symbol)
         if entry_price is None:
-            import sys
             sys.stdout.write(f"[ERROR] Cannot estimate entry price for {symbol}\n")
             sys.stdout.flush()
-            return None
+            return None, None
+
         qty = self._calc_qty(symbol, equity, risk_pct, entry_price)
         order_side = side  # long → buy, short → sell
 
-        # Alpaca bracket: market order with stop_loss and take_profit as child legs
+        # Step 1: Submit market order
         order_body = {
             "symbol": alpaca_sym,
             "qty": str(qty),
             "side": order_side,
             "type": "market",
-            "time_in_force": "gtc",
-            "order_class": "bracket",
-            "stop_loss": {
-                "stop_price": None,   # filled below
-                "limit_price": None,
-            },
-            "take_profit": {
-                "limit_price": None,  # filled below
-            },
+            "time_in_force": "day",
         }
+        try:
+            entry_result = self._post("/v2/orders", order_body)
+            entry_order_id = entry_result.get("id")
+            sys.stdout.write(f"[INFO] Alpaca market order submitted: {entry_order_id} {side} {qty} {symbol}\n")
+            sys.stdout.flush()
+        except httpx.HTTPStatusError as e:
+            sys.stdout.write(f"[ERROR] Alpaca entry failed for {symbol}: {e.response.text}\n")
+            sys.stdout.flush()
+            return None, None
 
-        # Calculate TP/SL prices relative to actual entry
-        if side == "long":
-            stop_price = round(entry_price * (1 - stop_loss_pct), 4)
-            tp_limit = round(entry_price * (1 + take_profit_pct), 4)
-        else:  # short
-            stop_price = round(entry_price * (1 + stop_loss_pct), 4)
-            tp_limit = round(entry_price * (1 - take_profit_pct), 4)
+        # Step 2: Wait for fill (up to 15s)
+        filled_price = None
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                orders = self._get(f"/v2/orders?status=filled&limit=5")
+                for o in orders:
+                    if o.get("id") == entry_order_id and o.get("status") == "filled":
+                        filled_price = float(o.get("filled_avg_price", entry_price))
+                        sys.stdout.write(f"[INFO] Alpaca entry FILL: {filled_price} (order {entry_order_id})\n")
+                        sys.stdout.flush()
+                        break
+                if filled_price:
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
 
-        order_body["stop_loss"]["stop_price"] = str(stop_price)
-        order_body["take_profit"]["limit_price"] = str(tp_limit)
+        if filled_price is None:
+            # Could not get fill — use estimated price but log warning
+            filled_price = entry_price
+            sys.stdout.write(f"[WARN] Alpaca fill not confirmed for {symbol}, using estimate {entry_price}\n")
+            sys.stdout.flush()
+
+        # Step 3: Submit separate TP and SL orders with the real filled price
+        close_side = "sell" if side == "long" else "buy"
+        self._submit_tp_sl(alpaca_sym, qty, close_side, filled_price, stop_loss_pct, take_profit_pct)
+
+        return entry_order_id, filled_price
+
+    def _submit_tp_sl(self, alpaca_sym, qty, close_side, entry_price, sl_pct, tp_pct):
+        """Submit separate take-profit and stop-loss orders from a known entry price."""
+        # For stop-loss: opposite side from entry. Buy to close long, sell to close short.
+        # For take-profit: same as close_side (opposite of entry)
+        if close_side == "sell":  # was long (entry was buy), close by selling
+            stop_price = round(entry_price * (1 - sl_pct), 4)
+            tp_price = round(entry_price * (1 + tp_pct), 4)
+            sl_type, tp_type = "stop", "limit"
+        else:  # was short (entry was sell), close by buying
+            stop_price = round(entry_price * (1 + sl_pct), 4)
+            tp_price = round(entry_price * (1 - tp_pct), 4)
+            sl_type, tp_type = "stop", "limit"
 
         try:
-            result = self._post("/v2/orders", order_body)
-            return result.get("id")
-        except httpx.HTTPStatusError as e:
-            # Log but don't crash — loop continues
-            import sys
-            sys.stdout.write(f"[ERROR] Alpaca submit_entry failed for {symbol}: {e.response.text}\n")
+            # Stop loss
+            sl_order = self._post("/v2/orders", {
+                "symbol": alpaca_sym,
+                "qty": str(qty),
+                "side": close_side,       # sell to close long, buy to close short
+                "type": sl_type,
+                "stop_price": str(stop_price),
+                "time_in_force": "gtc",
+            })
+            sys.stdout.write(f"[INFO] Alpaca SL: {sl_order.get('id')} stop={stop_price}\n")
             sys.stdout.flush()
-            return None
+
+            # Take profit
+            tp_order = self._post("/v2/orders", {
+                "symbol": alpaca_sym,
+                "qty": str(qty),
+                "side": close_side,
+                "type": tp_type,
+                "limit_price": str(tp_price),
+                "time_in_force": "gtc",
+            })
+            sys.stdout.write(f"[INFO] Alpaca TP: {tp_order.get('id')} limit={tp_price}\n")
+            sys.stdout.flush()
+        except httpx.HTTPStatusError as e:
+            sys.stdout.write(f"[ERROR] Alpaca TP/SL failed: {e.response.text}\n")
+            sys.stdout.flush()
 
     def submit_market_order(self, symbol: str, qty: Optional[float], side: str) -> Optional[str]:
         """Close a position with a market order.
@@ -167,7 +219,6 @@ class AlpacaBroker:
         if qty is None:
             pos = self.get_position(alpaca_sym)
             if pos is None:
-                import sys
                 sys.stdout.write(f"[WARN] No Alpaca position for {symbol} to close\n")
                 sys.stdout.flush()
                 return None
@@ -182,7 +233,6 @@ class AlpacaBroker:
             })
             return result.get("id")
         except httpx.HTTPStatusError as e:
-            import sys
             sys.stdout.write(f"[ERROR] Alpaca submit_market_order failed for {symbol}: {e.response.text}\n")
             sys.stdout.flush()
             return None
@@ -193,7 +243,6 @@ class AlpacaBroker:
         try:
             return self._delete(path)
         except httpx.HTTPStatusError as e:
-            import sys
             sys.stdout.write(f"[ERROR] Alpaca close failed: {e.response.text}\n")
             sys.stdout.flush()
             return None
@@ -203,7 +252,7 @@ class AlpacaBroker:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                orders = self._get("/v2/orders")["orders"]
+                orders = self._get("/v2/orders")
                 for o in orders:
                     if o["id"] == order_id:
                         if o["status"] == "filled":
@@ -243,7 +292,6 @@ class AlpacaBroker:
         Price difference is negligible (<0.1%) so we use the USD price as proxy.
         Returns None if fetch fails — callers should have a fallback.
         """
-        import os
         data_base = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
         data_key = os.getenv("ALPACA_DATA_API_KEY", self.api_key)
         data_secret = os.getenv("ALPACA_DATA_API_SECRET", self.api_secret)
@@ -283,7 +331,6 @@ class AlpacaBroker:
                         del_id = o["id"]
                         self._client.delete(f"/v2/orders/{del_id}")
         except Exception as e:
-            import sys
             sys.stdout.write(f"[WARN] cancel_open_orders failed: {e}\n")
             sys.stdout.flush()
 
