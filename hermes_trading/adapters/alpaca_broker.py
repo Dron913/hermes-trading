@@ -1,4 +1,18 @@
 """Alpaca paper trading broker — real orders on Alpaca, OHLCV stays via ccxt."""
+
+
+def _round_qty(qty: float, alpaca_sym: str) -> float:
+    """Round quantity to asset-specific lot size."""
+    if alpaca_sym == "BTCUSD":
+        return round(qty, 4)
+    elif alpaca_sym in ("ETHUSD", "SOLUSD"):
+        return round(qty, 3)
+    elif alpaca_sym == "XRPUSD":
+        return round(qty, 1)
+    else:
+        return round(qty, 2)
+
+
 import httpx, os, sys, time
 from typing import Dict, Optional
 
@@ -117,8 +131,23 @@ class AlpacaBroker:
             sys.stdout.flush()
             return None, None
 
-        qty = self._calc_qty(symbol, equity, risk_pct, entry_price)
-        # Convert strategy side (long=buy, short=sell) to Alpaca side
+        # Use Alpaca's ACTUAL buying power to size the order
+        try:
+            buying_power = self.get_buying_power()
+        except Exception:
+            buying_power = equity
+        # Cap at 85% of buying power to ensure some buffer for fees/slippage
+        max_equity = buying_power * 0.85
+        effective_equity = min(equity, max_equity)
+        qty = self._calc_qty(symbol, effective_equity, risk_pct, entry_price)
+
+        # Ensure cost basis >= $10 (Alpaca minimum for crypto)
+        min_notional = 10.0
+        cost_basis = qty * entry_price
+        if cost_basis < min_notional:
+            qty = min_notional / entry_price
+            qty = self._round_qty(qty, alpaca_sym)
+
         order_side = "buy" if side == "long" else "sell"
 
         # Step 1: Submit market order
@@ -132,14 +161,33 @@ class AlpacaBroker:
         try:
             entry_result = self._post("/v2/orders", order_body)
             entry_order_id = entry_result.get("id")
-            sys.stdout.write(f"[INFO] Alpaca market order submitted: {entry_order_id} {side} {qty} {symbol}\n")
+            sys.stdout.write(f"[INFO] Alpaca market order: {entry_order_id} {order_side} {qty} {alpaca_sym} (cost=${qty*entry_price:.2f})\n")
             sys.stdout.flush()
         except httpx.HTTPStatusError as e:
-            sys.stdout.write(f"[ERROR] Alpaca entry failed for {symbol}: {e.response.text}\n")
+            err_body = e.response.json()
+            sys.stdout.write(f"[ERROR] Alpaca entry failed for {symbol}: {err_body}\n")
             sys.stdout.flush()
-            return None, None
+            # Retry with smaller qty if balance was the issue
+            if "insufficient" in err_body.get("message", "").lower() or "balance" in err_body.get("message", "").lower():
+                smaller_equity = buying_power * 0.5
+                qty2 = self._calc_qty(symbol, smaller_equity, risk_pct, entry_price)
+                cost2 = qty2 * entry_price
+                if cost2 >= min_notional:
+                    order_body2 = dict(order_body)
+                    order_body2["qty"] = str(qty2)
+                    try:
+                        result2 = self._post("/v2/orders", order_body2)
+                        entry_order_id = result2.get("id")
+                        sys.stdout.write(f"[INFO] Alpaca retry OK: {entry_order_id} {qty2} (cost=${cost2:.2f})\n")
+                        sys.stdout.flush()
+                    except httpx.HTTPStatusError:
+                        return None, None
+                else:
+                    return None, None
+            else:
+                return None, None
 
-        # Step 2: Wait for fill (up to 15s)
+        # Step 2: Poll for fill (up to 15s)
         filled_price = None
         deadline = time.time() + 15
         while time.time() < deadline:
@@ -158,14 +206,12 @@ class AlpacaBroker:
             time.sleep(1)
 
         if filled_price is None:
-            # Could not get fill — use estimated price but log warning
             filled_price = entry_price
             sys.stdout.write(f"[WARN] Alpaca fill not confirmed for {symbol}, using estimate {entry_price}\n")
             sys.stdout.flush()
 
-        # Step 3: Submit separate TP and SL orders with the real filled price
-        close_side = "sell" if side == "long" else "buy"
-        self._submit_tp_sl(alpaca_sym, qty, close_side, filled_price, stop_loss_pct, take_profit_pct)
+        # Step 3: Submit TP and SL after confirming entry fill price
+        self._submit_tp_sl(alpaca_sym, qty, order_side, filled_price, stop_loss_pct, take_profit_pct)
 
         return entry_order_id, filled_price
 
@@ -269,14 +315,9 @@ class AlpacaBroker:
     # -------------------------------------------------------------------------
     # Utility
     # -------------------------------------------------------------------------
-    def _calc_qty(self, symbol: str, equity: float, risk_pct: float, entry_price: float) -> float:
-        """Calculate position size in base units based on risk % of equity."""
-        alpaca_sym = KRKEN_TO_ALPACA.get(symbol, symbol)
-        if entry_price is None or entry_price <= 0:
-            return 0.0
-        dollar_risk = equity * risk_pct
-        qty = dollar_risk / entry_price
-        # Round to asset-specific lot sizes
+    @staticmethod
+    def _round_qty(qty: float, alpaca_sym: str) -> float:
+        """Round quantity to asset-specific lot size."""
         if alpaca_sym == "BTCUSD":
             return round(qty, 4)
         elif alpaca_sym in ("ETHUSD", "SOLUSD"):
@@ -285,6 +326,15 @@ class AlpacaBroker:
             return round(qty, 1)
         else:
             return round(qty, 2)
+
+    def _calc_qty(self, symbol: str, equity: float, risk_pct: float, entry_price: float) -> float:
+        """Calculate position size in base units based on risk % of equity."""
+        alpaca_sym = KRKEN_TO_ALPACA.get(symbol, symbol)
+        if entry_price is None or entry_price <= 0:
+            return 0.0
+        dollar_risk = equity * risk_pct
+        qty = dollar_risk / entry_price
+        return self._round_qty(qty, alpaca_sym)
 
     def get_current_price(self, symbol: str) -> Optional[float]:
         """Latest trade price from Alpaca crypto market data.
