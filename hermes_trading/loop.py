@@ -163,17 +163,15 @@ class TradingLoop:
         if _key and _secret:
             self._broker = AlpacaBroker(_key, _secret)
             console.print(f"[bold cyan]Alpaca broker initialized (paper trading)[/bold cyan]")
-            # Sync Alpaca equity to local state so position sizing is accurate
+            # Cancel any stale pending orders from previous runs so they don't
+            # consume buying power and cause wash-trade rejections
             try:
-                alpaca_equity = self._broker.get_equity()
-                self._starting_balance = alpaca_equity
-                # Overwrite paper_account.yaml so StatusWriter reflects real equity
-                yaml_path = sd.parent / "paper_account.yaml"
-                yaml_path.parent.mkdir(parents=True, exist_ok=True)
-                yaml.safe_dump({"starting_balance": alpaca_equity}, yaml_path.open("w"))
-                console.print(f"[bold cyan]  Synced Alpaca equity: ${alpaca_equity:,.2f}[/bold cyan]")
+                cancelled = self._broker._client.delete("/v2/orders")
+                if cancelled.status_code == 200:
+                    n = len(cancelled.json())
+                    console.print(f"[bold cyan]  Cancelled {n} stale Alpaca orders[/bold cyan]")
             except Exception as e:
-                console.print(f"[yellow]  Could not sync Alpaca equity: {e} — using yaml balance[/yellow]")
+                console.print(f"[yellow]  Could not cancel stale orders: {e}[/yellow]")
         else:
             console.print("[yellow]ALPACA_API_KEY/SECRET not set — running in simulation mode[/yellow]")
         # Alpaca: sync equity BEFORE StatusWriter init so the yaml has correct balance
