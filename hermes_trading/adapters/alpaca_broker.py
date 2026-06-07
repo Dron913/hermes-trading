@@ -132,13 +132,18 @@ class AlpacaBroker:
             return None, None
 
         # Use Alpaca's ACTUAL buying power to size the order
+        # For small accounts (<$1500), use equity directly to avoid the 0.85x
+        # haircut dropping the cost basis below Alpaca's $10 minimum per order
         try:
             buying_power = self.get_buying_power()
         except Exception:
             buying_power = equity
-        # Cap at 85% of buying power to ensure some buffer for fees/slippage
-        max_equity = buying_power * 0.85
-        effective_equity = min(equity, max_equity)
+        # Only cap orders for accounts with $1500+ buying power
+        if buying_power >= 1500:
+            effective_equity = min(equity, buying_power * 0.85)
+        else:
+            effective_equity = equity
+
         qty = self._calc_qty(symbol, effective_equity, risk_pct, entry_price)
 
         # Ensure cost basis >= $10 (Alpaca minimum for crypto)
