@@ -17,6 +17,7 @@ from rich.table import Table
 from .adapters.price import fetch_ohlcv_multitimeframe
 from .adapters.onchain import fetch_onchain
 from .adapters.macro import fetch_macro
+from .adapters.alpaca_broker import AlpacaBroker
 from .score import score_trades
 
 
@@ -155,6 +156,15 @@ class TradingLoop:
         self.max_failures = 5
         # Positions dict: {signal_asset: {entry_price, entry_time, side, indicators}}
         self._positions: dict[str, dict] = {}
+        # Alpaca broker — initialized if credentials are set in env
+        self._broker: Optional[AlpacaBroker] = None
+        _key = os.getenv("ALPACA_API_KEY")
+        _secret = os.getenv("ALPACA_API_SECRET")
+        if _key and _secret:
+            self._broker = AlpacaBroker(_key, _secret)
+            console.print(f"[bold cyan]Alpaca broker initialized (paper trading)[/bold cyan]")
+        else:
+            console.print("[yellow]ALPACA_API_KEY/SECRET not set — running in simulation mode[/yellow]")
         self.exchange = ccxt.kraken({"enableRateLimit": True})
         self._status_writer = StatusWriter(self.status_path)
         # Exit Intelligence — initialized lazily at first trade close
@@ -202,14 +212,62 @@ class TradingLoop:
         strategy = self.load_strategy()
         max_open = strategy.get("max_open_positions", 4)
         starting_balance = self._status_writer._starting_balance
-        DD_THRESHOLD_PCT = 15.0  # pause new entries if balance is >15% below peak
+
+        # --- Alpaca: sync open positions at cycle start ---
+        # Captures fills that happened via bracket TP/SL auto-exit, writes records
+        if self._broker:
+            try:
+                alpaca_positions = self._broker.get_positions()
+                still_open = set(alpaca_positions.keys())
+
+                # Any _positions entry that vanished from Alpaca was closed externally
+                closed_offline = [a for a in list(self._positions) if a not in still_open]
+                for asset in closed_offline:
+                    pos = self._positions[asset]
+                    sys.stdout.write(
+                        f"DETECTED CLOSE: {asset} closed via Alpaca bracket "
+                        f"(entry={pos['entry_price']:.4f})\n"
+                    )
+                    sys.stdout.flush()
+                    # Use last tracked MFE as estimate (bracket hit while we tracked it)
+                    est_pnl = pos.get("_mfe", 0.0) * 0.5  # conservative: assume ~50% of peak was left
+                    await self.close_trade(
+                        asset, pos["side"], pos["entry_price"],
+                        pos["entry_price"], est_pnl,
+                        "bracket_auto_close", {}, strategy, pos,
+                    )
+                    del self._positions[asset]
+
+                # Alpaca positions not yet in local mem → new fills; add them
+                for asset, pos in alpaca_positions.items():
+                    if asset not in self._positions:
+                        console.print(
+                            f"[bold green]SYNC Alpaca fill: {pos['side'].upper()} {asset} "
+                            f"@ {pos['entry_price']:.4f}[/bold green]"
+                        )
+                        self._positions[asset] = {
+                            "entry_price": pos["entry_price"],
+                            "entry_time": datetime.now(timezone.utc).isoformat(),
+                            "side": pos["side"],
+                            "_mfe": 0.0,
+                            "_mae": 0.0,
+                            "indicators": {},
+                            "_alpaca_filled": True,
+                        }
+                    else:
+                        self._positions[asset]["_mfe"] = max(
+                            self._positions[asset].get("_mfe", 0.0),
+                            pos.get("unrealized_pl_pct", 0.0),
+                        )
+            except Exception as e:
+                console.print(f"[yellow]Alpaca position sync failed: {e}[/yellow]")
 
         # --- Drawdown circuit breaker ---
-        # Tracks peak balance across all closed trades; pauses entries if DD exceeds threshold
+        DD_THRESHOLD_PCT = 15.0  # pause if >15% below peak
         realized_pnl = sum(
             float(t.get("pnl_pct", 0.0)) for t in self._read_trades()
         )
-        current_balance_pct = realized_pnl  # relative to starting balance
+        current_balance_pct = realized_pnl
         if self._peak_balance_pct == 0.0:
             self._peak_balance_pct = current_balance_pct  # initialize on first run
         elif current_balance_pct > self._peak_balance_pct:
@@ -431,8 +489,9 @@ class TradingLoop:
             "entry_price": price,
             "entry_time": datetime.now(timezone.utc).isoformat(),
             "side": side,
-            "_mfe": 0.0,   # Max Favorable Excursion (best % in our favor during trade)
-            "_mae": 0.0,   # Max Adverse Excursion (worst % against us during trade)
+            "_mfe": 0.0,
+            "_mae": 0.0,
+            "_alpaca_filled": False,
             "indicators": {
                 "signal_asset": asset,
                 "rsi_4h": tf_data["4h"]["rsi"],
@@ -446,6 +505,27 @@ class TradingLoop:
                 "entry_price": price,
             },
         }
+
+        # --- Alpaca: submit real bracket order ---
+        if self._broker:
+            _strategy = self.load_strategy()
+            equity = self._broker.get_equity()
+            risk_pct = _strategy.get("risk_per_trade_pct", 1.0) / 100.0
+            sl_pct = _strategy.get("stop_loss_pct", 0.3) / 100.0
+            tp_pct = _strategy.get("take_profit_pct", 1.8) / 100.0
+            order_id = self._broker.submit_entry(
+                symbol=asset, side=side, equity=equity,
+                risk_pct=risk_pct, stop_loss_pct=sl_pct,
+                take_profit_pct=tp_pct, entry_price=price,
+            )
+            if order_id:
+                self._positions[asset]["_alpaca_order_id"] = order_id
+                console.print(
+                    f"[bold cyan]  Alpaca: {order_id} "
+                    f"(equity=${equity:,.0f}, risk={risk_pct*100:.1f}%)[/bold cyan]"
+                )
+            else:
+                console.print(f"[bold red]  Alpaca order FAILED — stored locally[/bold red]")
         console.print(
             f"[bold green]OPEN {side.upper()} {price:.4f} {asset}[/bold green] "
             f"(score={q_scores.get(asset, 0):.1f}, pos={len(self._positions)}/4)"
@@ -463,6 +543,16 @@ class TradingLoop:
         strategy: dict,
         pos: dict,
     ):
+        # --- Alpaca: close position at market ---
+        if self._broker:
+            close_side = "sell" if side == "long" else "buy"
+            result = self._broker.submit_market_order(asset, qty=None, side=close_side)
+            if result:
+                console.print(f"[bold cyan]  Alpaca close: {result}[/bold cyan]")
+            else:
+                sys.stdout.write(f"[WARN] Alpaca close order failed for {asset}\n")
+                sys.stdout.flush()
+
         # --- Exit Intelligence: MFE/MAE tracking ---
         mfe_pct = pos.get("_mfe", 0.0)
         mae_pct = pos.get("_mae", 0.0)
