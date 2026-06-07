@@ -436,7 +436,8 @@ class TradingLoop:
             # Expose signal values every cycle for log debugging
             q_scores = {a: sc for sc, a, _ in rated}
             sys.stdout.write(
-                f"SIGNAL asset={asset} h1_RSI={h1['rsi']:.0f} rsi_req={rsi_threshold:.0f} "
+                f"SIGNAL dir={direction} h4trend={('short_ok' if h4_trend_short_ok else 'long_ok' if h4_trend_long_ok else 'NEUTRAL')} "
+                f"asset={asset} h1_RSI={h1['rsi']:.0f} rsi_req={rsi_threshold:.0f} "
                 f"m15_RSI={m15['rsi']:.0f} m15_req={m15_cross:.0f} "
                 f"VS={vol_ratio:.2f} long={long_trigger} short={short_trigger} "
                 f"qual={q:.1f} open_pos={len(self._positions)}/{max_open}\n"
