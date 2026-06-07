@@ -163,6 +163,17 @@ class TradingLoop:
         if _key and _secret:
             self._broker = AlpacaBroker(_key, _secret)
             console.print(f"[bold cyan]Alpaca broker initialized (paper trading)[/bold cyan]")
+            # Sync Alpaca equity to local state so position sizing is accurate
+            try:
+                alpaca_equity = self._broker.get_equity()
+                self._starting_balance = alpaca_equity
+                # Overwrite paper_account.yaml so StatusWriter reflects real equity
+                yaml_path = sd.parent / "paper_account.yaml"
+                yaml_path.parent.mkdir(parents=True, exist_ok=True)
+                yaml.safe_dump({"starting_balance": alpaca_equity}, yaml_path.open("w"))
+                console.print(f"[bold cyan]  Synced Alpaca equity: ${alpaca_equity:,.2f}[/bold cyan]")
+            except Exception as e:
+                console.print(f"[yellow]  Could not sync Alpaca equity: {e} — using yaml balance[/yellow]")
         else:
             console.print("[yellow]ALPACA_API_KEY/SECRET not set — running in simulation mode[/yellow]")
         self.exchange = ccxt.kraken({"enableRateLimit": True})
