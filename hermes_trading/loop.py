@@ -160,6 +160,9 @@ class TradingLoop:
         # Exit Intelligence — initialized lazily at first trade close
         self._ei_analyzer = None
         self._ei_root = sd
+        # Drawdown protection — tracks peak balance and pauses entries when -15% DD hit
+        self._peak_balance_pct = 0.0  # 0 = uninitialized (set on first balance calculation)
+        self._dd_pause_trades = False
 
     @property
     def _position_open(self) -> bool:
@@ -198,6 +201,27 @@ class TradingLoop:
         """Fetch data, rank assets, check exits + fire entries (multi-position)."""
         strategy = self.load_strategy()
         max_open = strategy.get("max_open_positions", 4)
+        starting_balance = self._status_writer._starting_balance
+        DD_THRESHOLD_PCT = 15.0  # pause new entries if balance is >15% below peak
+
+        # --- Drawdown circuit breaker ---
+        # Tracks peak balance across all closed trades; pauses entries if DD exceeds threshold
+        realized_pnl = sum(
+            float(t.get("pnl_pct", 0.0)) for t in self._read_trades()
+        )
+        current_balance_pct = realized_pnl  # relative to starting balance
+        if self._peak_balance_pct == 0.0:
+            self._peak_balance_pct = current_balance_pct  # initialize on first run
+        elif current_balance_pct > self._peak_balance_pct:
+            self._peak_balance_pct = current_balance_pct  # new peak
+
+        dd_from_peak = self._peak_balance_pct - current_balance_pct
+        if dd_from_peak >= DD_THRESHOLD_PCT and not self._dd_pause_trades:
+            self._dd_pause_trades = True
+            console.print(f"[bold red]DRAWDOWN TRIGGERED: {dd_from_peak:.1f}% below peak — pausing new entries[/bold red]")
+        elif dd_from_peak < DD_THRESHOLD_PCT * 0.5 and self._dd_pause_trades:
+            self._dd_pause_trades = False
+            console.print(f"[bold green]Drawdown recovered ({dd_from_peak:.1f}% below peak) — resuming entries[/bold green]")
 
         # --- Fetch all asset data ---
         rated = []
@@ -232,7 +256,9 @@ class TradingLoop:
         sl = strategy["stop_loss_pct"]
         direction = strategy["entry"].get("direction", "both")
         rsi_threshold = strategy["setup_1h"]["rsi_threshold"]
-        m15_cross = strategy["trigger_15m"]["rsi_cross"]
+        # Default to 50 (rsi_cross=50 means 15M RSI crosses AT the threshold, not way past it)
+        # Previous default of 90.0 made shorts require 15M RSI < 10 and longs require > 90 — impossible
+        m15_cross = strategy["trigger_15m"].get("rsi_cross", 50)
 
         entries_to_open: list[tuple] = []   # (asset, tf_data) for new entries
         closes_triggered: int = 0
@@ -256,22 +282,37 @@ class TradingLoop:
                 should_exit_sl = pnl_pct <= -sl
                 should_exit_rsi = (side == "long" and h1["rsi"] < strategy["early_exit_1h_rsi"]) or \
                                  (side == "short" and h1["rsi"] > (100 - strategy["early_exit_1h_rsi"]))
+                # Trailing stop: if we were profitable (MFE > 0.5%) but gave back 70% of gains, exit
+                # Replaces the old "exit" fallback which had no justification
+                should_exit_trailing = (
+                    pos["_mfe"] > 0.5 and
+                    pnl_pct < (pos["_mfe"] * 0.3)  # only 30% of peak profit remaining
+                )
 
                 # Track MFE/MAE on every evaluation tick (including final tick before close)
                 pos["_mfe"] = max(pos["_mfe"], pnl_pct)
                 pos["_mae"] = min(pos["_mae"], pnl_pct)
 
-                # Determine specific exit reason (priority: TP > SL > RSI > exit)
+                # Determine specific exit reason (priority: TP > SL > trailing > RSI)
                 if should_exit_tp:
                     exit_reason_str = "take_profit"
                 elif should_exit_sl:
                     exit_reason_str = "stop_loss"
+                elif should_exit_trailing:
+                    exit_reason_str = "trailing_stop"
                 elif should_exit_rsi:
                     exit_reason_str = "early_exit_1h_rsi"
                 else:
-                    exit_reason_str = "exit"  # no specific signal triggered
+                    # This branch should never be reached if should_exit is computed correctly.
+                    # Defensive: log and skip the close to prevent unjustified exits.
+                    sys.stdout.write(
+                        f"[WARN] No exit signal for {asset} but should_exit=True — "
+                        f"skipping close (mfe={pos['_mfe']:+.2f}% pnl={pnl_pct:+.2f}%)\n"
+                    )
+                    sys.stdout.flush()
+                    continue
 
-                should_exit = should_exit_tp or should_exit_sl or should_exit_rsi
+                should_exit = should_exit_tp or should_exit_sl or should_exit_trailing or should_exit_rsi
 
                 if should_exit:
                     await self.close_trade(asset, side, entry_price, h1["close"], pnl_pct, exit_reason_str, tf_data, strategy, pos)
@@ -293,17 +334,26 @@ class TradingLoop:
             if len(self._positions) >= max_open:
                 continue
 
-            # Entry signals: dual RSI — h1 RSI + m15 RSI cross
+            # Entry signals: 4H trend filter + dual RSI — h1 RSI + m15 RSI cross
+            # 4H EMA50 trend ensures we only trade WITH the larger timeframe direction,
+            # preventing counter-trend entries that were losing 87% of the time
+            h4_trend_long_ok  = h4["close"] > h4["ema50"]
+            h4_trend_short_ok = h4["close"] < h4["ema50"]
             vol_ratio = h1["volume"] / h1["vol_avg"]
+
             long_trigger = (
-                direction in ("long", "both")
-                and rsi_threshold < h1["rsi"] < 70          # oversold recovery zone
-                and m15_cross < m15["rsi"]                  # 15M gaining momentum
+                self._dd_pause_trades is False
+                and direction in ("long", "both")
+                and h4_trend_long_ok                          # NEW: 4H must be in uptrend
+                and rsi_threshold < h1["rsi"] < 70            # oversold recovery zone
+                and m15_cross < m15["rsi"]                    # 15M gaining momentum past threshold
             )
             short_trigger = (
-                direction in ("short", "both")
-                and 30 < h1["rsi"] < (100 - rsi_threshold)  # overbought reversal zone
-                and m15["rsi"] < (100 - m15_cross)           # 15M losing momentum
+                self._dd_pause_trades is False
+                and direction in ("short", "both")
+                and h4_trend_short_ok                         # NEW: 4H must be in downtrend
+                and 30 < h1["rsi"] < (100 - rsi_threshold)   # overbought reversal zone
+                and m15["rsi"] < (100 - m15_cross)           # 15M losing momentum past threshold
             )
 
             # Expose signal values every cycle for log debugging

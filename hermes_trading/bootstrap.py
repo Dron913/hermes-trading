@@ -31,15 +31,41 @@ def main():
         print("[BOOT] Fresh volume — seeding from /app/defaults/")
     sys.stdout.flush()
 
-    # Gap-fill only: essential state files must exist in /app/state/,
-    # but we NEVER overwrite existing data — that's the user's learning.
+    # Rebuild from defaults — ensures all essential state files exist with real content.
+    # On FIRST DEPLOY (volume empty): all files seeded from defaults.
+    # On CORRUPTED volume (files contain only placeholder "OK" etc.): delete + re-seed.
+    # On HEALTHY volume (has real data): gap-fill only (never overwrite).
     for f in defaults.rglob("*"):
         if f.is_file() and "/.venv/" not in str(f):
             rel = f.relative_to(defaults)
             dest = state / rel
-            if not dest.exists():
+            content_ok = False
+            is_json = dest.suffix in (".json", ".jsonl")
+            is_yaml = dest.suffix in (".yaml", ".yml")
+
+            if dest.exists():
+                raw = dest.read_text(encoding="utf-8").strip()
+                # Corrupted: file is empty, or contains only placeholder "OK"/"true"/"false"
+                if raw in ("", "OK", "true", "false", "null"):
+                    print(f"[BOOT] Corrupted state file '{rel}' — removing for re-seed")
+                    dest.unlink()
+                else:
+                    # Non-empty, non-placeholder content — keep existing (preserve learning)
+                    content_ok = True
+
+            if not content_ok and not dest.exists():
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(f.read_bytes())
+
+    # Also ensure runtime-generated files exist (not in defaults/ but needed by worker)
+    runtime_files = {
+        "status.json": json.dumps({"open_positions": [], "paper_account": {"starting_balance": 100000, "current_balance": 100000, "realized_pnl_usd": 0, "unrealized_pnl_usd": 0, "available_capital": 100000, "deployed_capital": 0, "capital_utilization_pct": 0.0}}, indent=2),
+    }
+    for fname, default_content in runtime_files.items():
+        fp = state / fname
+        if not fp.exists() or fp.read_text(encoding="utf-8").strip() in ("", "OK", "true", "false", "null"):
+            print(f"[BOOT] Re-seeding runtime file '{fname}'")
+            fp.write_text(default_content, encoding="utf-8")
 
     seeded = [str(p.relative_to(state)) for p in state.rglob("*") if p.is_file()]
     print(f"[BOOT] State in volume: {seeded}")
