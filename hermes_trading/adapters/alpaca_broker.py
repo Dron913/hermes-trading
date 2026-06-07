@@ -118,7 +118,8 @@ class AlpacaBroker:
             return None, None
 
         qty = self._calc_qty(symbol, equity, risk_pct, entry_price)
-        order_side = side  # long → buy, short → sell
+        # Convert strategy side (long=buy, short=sell) to Alpaca side
+        order_side = "buy" if side == "long" else "sell"
 
         # Step 1: Submit market order
         order_body = {
