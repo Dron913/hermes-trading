@@ -156,6 +156,8 @@ class AlpacaBroker:
         order_side = "buy" if side == "long" else "sell"
 
         # Step 1: Submit market order
+        sys.stdout.write(f"[INFO] Alpaca ORDER ATTEMPT: {side} {qty} {alpaca_sym} (cost=${qty*entry_price:.2f}, bp=${buying_power:.2f})\n")
+        sys.stdout.flush()
         order_body = {
             "symbol": alpaca_sym,
             "qty": str(qty),
@@ -166,14 +168,16 @@ class AlpacaBroker:
         try:
             entry_result = self._post("/v2/orders", order_body)
             entry_order_id = entry_result.get("id")
-            sys.stdout.write(f"[INFO] Alpaca market order: {entry_order_id} {order_side} {qty} {alpaca_sym} (cost=${qty*entry_price:.2f})\n")
+            sys.stdout.write(f"[INFO] Alpaca market order submitted: {entry_order_id}\n")
             sys.stdout.flush()
         except httpx.HTTPStatusError as e:
             err_body = e.response.json()
             sys.stdout.write(f"[ERROR] Alpaca entry failed for {symbol}: {err_body}\n")
             sys.stdout.flush()
-            # Retry with smaller qty if balance was the issue
+            # Retry with 50% of buying power (if balance was the issue)
             if "insufficient" in err_body.get("message", "").lower() or "balance" in err_body.get("message", "").lower():
+                sys.stdout.write(f"[WARN] Alpaca retry for {symbol} due to: {err_body.get('message','?')}\n")
+                sys.stdout.flush()
                 smaller_equity = buying_power * 0.5
                 qty2 = self._calc_qty(symbol, smaller_equity, risk_pct, entry_price)
                 cost2 = qty2 * entry_price
@@ -238,12 +242,12 @@ class AlpacaBroker:
             sl_order = self._post("/v2/orders", {
                 "symbol": alpaca_sym,
                 "qty": str(qty),
-                "side": close_side,       # sell to close long, buy to close short
+                "side": close_side,
                 "type": sl_type,
                 "stop_price": str(stop_price),
                 "time_in_force": "gtc",
             })
-            sys.stdout.write(f"[INFO] Alpaca SL: {sl_order.get('id')} stop={stop_price}\n")
+            sys.stdout.write(f"[INFO] Alpaca SL: {sl_order.get('id')} @ {stop_price} (type={sl_type})\n")
             sys.stdout.flush()
 
             # Take profit
@@ -255,7 +259,7 @@ class AlpacaBroker:
                 "limit_price": str(tp_price),
                 "time_in_force": "gtc",
             })
-            sys.stdout.write(f"[INFO] Alpaca TP: {tp_order.get('id')} limit={tp_price}\n")
+            sys.stdout.write(f"[INFO] Alpaca TP: {tp_order.get('id')} @ {tp_price} (type={tp_type})\n")
             sys.stdout.flush()
         except httpx.HTTPStatusError as e:
             sys.stdout.write(f"[ERROR] Alpaca TP/SL failed: {e.response.text}\n")
