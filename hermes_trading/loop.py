@@ -525,8 +525,8 @@ class TradingLoop:
             },
         }
 
-        # --- Alpaca: submit real market + TP/SL orders ---
-        if self._broker:
+        # --- Alpaca: submit ONLY for longs (Alpaca paper rejects crypto shorts)
+        if self._broker and side == "long":
             _strategy = self.load_strategy()
             equity = self._broker.get_equity()
             risk_pct = _strategy.get("risk_per_trade_pct", 1.0) / 100.0
@@ -551,7 +551,11 @@ class TradingLoop:
                         f"(equity=${equity:,.0f}, risk={risk_pct*100:.1f}%)[/bold cyan]"
                     )
             else:
-                console.print(f"[bold red]  Alpaca order FAILED — stored locally[/bold red]")
+                console.print(f"[bold yellow]  Alpaca long FAILED — stored locally[/bold yellow]")
+        elif self._broker and side == "short":
+            console.print(
+                f"[bold yellow]  Alpaca crypto shorts not supported — simulation mode[/bold yellow]"
+            )
         console.print(
             f"[bold green]OPEN {side.upper()} {price:.4f} {asset}[/bold green] "
             f"(score={q_scores.get(asset, 0):.1f}, pos={len(self._positions)}/4)"
@@ -569,8 +573,8 @@ class TradingLoop:
         strategy: dict,
         pos: dict,
     ):
-        # --- Alpaca: cancel any pending TP/SL, then close at market ---
-        if self._broker:
+        # --- Alpaca: close only positions that were filled in Alpaca ---
+        if self._broker and pos.get("_alpaca_filled"):
             close_side = "sell" if side == "long" else "buy"
             self._broker.cancel_open_orders(asset)
             result = self._broker.submit_market_order(asset, qty=None, side=close_side)
