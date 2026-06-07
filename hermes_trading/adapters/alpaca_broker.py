@@ -127,7 +127,7 @@ class AlpacaBroker:
             "qty": str(qty),
             "side": order_side,
             "type": "market",
-            "time_in_force": "day",
+            "time_in_force": "gtc",
         }
         try:
             entry_result = self._post("/v2/orders", order_body)
