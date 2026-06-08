@@ -333,9 +333,13 @@ class TradingLoop:
         sl = strategy["stop_loss_pct"]
         direction = strategy["entry"].get("direction", "both")
         rsi_threshold = strategy["setup_1h"]["rsi_threshold"]
-        # Default to 50 (rsi_cross=50 means 15M RSI crosses AT the threshold, not way past it)
-        # Previous default of 90.0 made shorts require 15M RSI < 10 and longs require > 90 — impossible
-        m15_cross = strategy["trigger_15m"].get("rsi_cross", 50)
+        # Default rsi_cross=55 means 15M RSI must cross ±5 pts vs the 50 center.
+        # Previous default of 50 required M15_RSI<50 for shorts — impossible when
+        # 1H RSI is 55-72 (overbought market) and M15 RSI stays 52-73.
+        # Current market: 1H RSI=55-72 (overbought range), need shallower pullbacks.
+        # 55 threshold: longs need M15_RSI > 55 (often met), shorts need M15_RSI < 45
+        # (achievable when market pulls back from 60-73 down to 40-45).
+        m15_cross = strategy["trigger_15m"].get("rsi_cross", 55)
 
         entries_to_open: list[tuple] = []   # (asset, tf_data) for new entries
         closes_triggered: int = 0
