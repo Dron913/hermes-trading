@@ -7,6 +7,7 @@ Phases:
   4 — Authority: Generate exit-modification proposals (requires human approval)
 """
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path

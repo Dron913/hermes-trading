@@ -57,6 +57,22 @@ def main():
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(f.read_bytes())
 
+    # --- Critical fix: update rsi_cross from 50→55 in persistent strategy.yaml ---
+    # Previous value required M15_RSI<50 for shorts, M15_RSI>50 for longs.
+    # When 1H RSI was in 55-72 range, M15 RSI stayed 52-73, making shorts impossible.
+    # 55 threshold: longs need M15>55 (achievable), shorts need M15<45 (achievable on pullback).
+    import re as _re
+    strat_path = state / "strategy.yaml"
+    if strat_path.exists():
+        content = strat_path.read_text(encoding="utf-8")
+        # Only patch if rsi_cross: 50 exists and hasn't been updated yet
+        if _re.search(r"rsi_cross:\s*50\b", content):
+            content = _re.sub(r"rsi_cross:\s*50\b", "rsi_cross: 55", content)
+            strat_path.write_text(content, encoding="utf-8")
+            print("[BOOT] Patched rsi_cross 50→55 in strategy.yaml")
+        else:
+            print("[BOOT] rsi_cross already up-to-date in strategy.yaml")
+
     # Also ensure runtime-generated files exist (not in defaults/ but needed by worker)
     runtime_files = {
         "status.json": json.dumps({"open_positions": [], "paper_account": {"starting_balance": 100000, "current_balance": 100000, "realized_pnl_usd": 0, "unrealized_pnl_usd": 0, "available_capital": 100000, "deployed_capital": 0, "capital_utilization_pct": 0.0}}, indent=2),
