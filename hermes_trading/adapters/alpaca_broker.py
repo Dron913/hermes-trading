@@ -196,35 +196,79 @@ class AlpacaBroker:
             else:
                 return None, None
 
-        # Step 2: Poll for fill (up to 15s)
-        # IMPORTANT: query the order DIRECTLY by ID, don't poll "filled" list
-        # which may not include the order and always loops through 5 recent fills
+        # Step 2: Poll for fill (up to 15s) + retry once on stuck-pending orders
+        # Alpaca BTC orders (and sometimes ETH/SOL) stay "new"/"pending_new" indefinitely
+        # even though the order was accepted. Cancel and retry with more qty.
         filled_price = None
-        deadline = time.time() + 15
-        while time.time() < deadline:
+        for attempt in range(2):  # try at most twice
+            entry_id = entry_order_id if attempt == 0 else None
+            deadline = time.time() + 15
+            order_id_for_attempt = entry_id or entry_order_id
+
+            while time.time() < deadline:
+                try:
+                    order_status = self._get(f"/v2/orders/{order_id_for_attempt}")
+                    status = order_status.get("status", "")
+                    sys.stdout.write(f"[INFO] Alpaca order {status}: {order_id_for_attempt}\n")
+                    sys.stdout.flush()
+                    if status == "filled":
+                        fp_str = order_status.get("filled_avg_price")
+                        filled_price = float(fp_str) if fp_str else entry_price
+                        sys.stdout.write(f"[INFO] Alpaca entry FILL: {filled_price}\n")
+                        sys.stdout.flush()
+                        break
+                    elif status in ("rejected", "canceled", "expired"):
+                        sys.stdout.write(f"[WARN] Alpaca order {status}: {order_id_for_attempt}\n")
+                        sys.stdout.flush()
+                        break
+                except httpx.HTTPStatusError:
+                    pass
+                except Exception:
+                    pass
+                time.sleep(2)
+
+            if filled_price is not None:
+                break  # got a fill
+
+            # Not filled in 15s — cancel this stuck order to free buying power
+            sys.stdout.write(f"[WARN] Alpaca order stuck (pending_new) for {symbol} — canceling\n")
+            sys.stdout.flush()
             try:
-                order_status = self._get(f"/v2/orders/{entry_order_id}")
-                status = order_status.get("status", "")
-                sys.stdout.write(f"[INFO] Alpaca order status: {status} for {entry_order_id}\n")
+                self._delete(f"/v2/orders/{order_id_for_attempt}")
+                sys.stdout.write(f"[INFO] Canceled stuck order {order_id_for_attempt}\n")
                 sys.stdout.flush()
-                if status == "filled":
-                    fp_str = order_status.get("filled_avg_price")
-                    filled_price = float(fp_str) if fp_str else entry_price
-                    sys.stdout.write(f"[INFO] Alpaca entry FILL: {filled_price} (order {entry_order_id})\n")
-                    sys.stdout.flush()
-                    break
-                elif status in ("rejected", "canceled", "expired"):
-                    sys.stdout.write(f"[ERROR] Alpaca order {status}: {entry_order_id}\n")
-                    sys.stdout.flush()
-                    break
-            except httpx.HTTPStatusError:
-                pass
             except Exception:
                 pass
-            time.sleep(2)
+
+            if attempt == 0 and qty < 1.0:  # only retry for small qty (< 1 BTC/ETH)
+                # Retry with 2x qty (larger orders have better chance of fill on Alpaca)
+                try:
+                    entry_price_retry = self.get_current_price(symbol) or entry_price
+                    qty_retry = qty * 2
+                    qty_retry = self._round_qty(qty_retry, alpaca_sym)
+                    cost_retry = qty_retry * entry_price_retry
+                    if cost_retry >= min_notional:
+                        sys.stdout.write(f"[INFO] Alpaca RETRY: {qty_retry} {alpaca_sym} (${cost_retry:.0f})\n")
+                        sys.stdout.flush()
+                        order_id_for_attempt = self._post("/v2/orders", {
+                            "symbol": alpaca_sym,
+                            "qty": str(qty_retry),
+                            "side": order_side,
+                            "type": "market",
+                            "time_in_force": "gtc",
+                        }).get("id")
+                        if order_id_for_attempt:
+                            entry_order_id = order_id_for_attempt
+                            sys.stdout.write(f"[INFO] Retry order submitted: {order_id_for_attempt}\n")
+                            sys.stdout.flush()
+                            continue  # poll this retry
+                except Exception as retry_err:
+                    sys.stdout.write(f"[ERROR] Alpaca retry failed: {retry_err}\n")
+                    sys.stdout.flush()
+            break  # already tried retry, give up
 
         if filled_price is None:
-            sys.stdout.write(f"[WARN] Alpaca entry not filled after 15s for {symbol} — not sending to Alpaca\n")
+            sys.stdout.write(f"[ERROR] Alpaca entry failed for {symbol} after retries\n")
             sys.stdout.flush()
             return None, None
 
