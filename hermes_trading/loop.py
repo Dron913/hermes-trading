@@ -415,9 +415,11 @@ class TradingLoop:
             if len(self._positions) >= max_open:
                 continue
 
-            # Entry signals: 4H trend filter + dual RSI — h1 RSI + m15 RSI cross
-            # 4H EMA50 trend ensures we only trade WITH the larger timeframe direction,
-            # preventing counter-trend entries that were losing 87% of the time
+            # Entry signals: dual RSI — h1 RSI + m15 RSI cross
+            # 4H trend filter only gates shorts (avoid catching falling knives).
+            # Removed from longs so we can accumulate in choppy/dip markets.
+            # When 4H is bullish AND RSI setup fires → high-quality long.
+            # When 4H is bearish AND RSI setup fires → short.
             h4_trend_long_ok  = h4["close"] > h4["ema50"]
             h4_trend_short_ok = h4["close"] < h4["ema50"]
             vol_ratio = h1["volume"] / h1["vol_avg"]
@@ -425,16 +427,16 @@ class TradingLoop:
             long_trigger = (
                 self._dd_pause_trades is False
                 and direction in ("long", "both")
-                and h4_trend_long_ok                          # NEW: 4H must be in uptrend
+                # No 4H filter on longs — ETH/SOL/XRP can bounce even when BTC leads down
                 and rsi_threshold < h1["rsi"] < 70            # oversold recovery zone
-                and m15_cross < m15["rsi"]                    # 15M gaining momentum past threshold
+                and m15_cross < m15["rsi"]                    # 15M RSI above threshold
             )
             short_trigger = (
                 self._dd_pause_trades is False
                 and direction in ("short", "both")
-                and h4_trend_short_ok                         # NEW: 4H must be in downtrend
+                and h4_trend_short_ok                         # 4H must be in downtrend
                 and 30 < h1["rsi"] < (100 - rsi_threshold)   # overbought reversal zone
-                and m15["rsi"] < (100 - m15_cross)           # 15M losing momentum past threshold
+                and m15["rsi"] < (100 - m15_cross)           # 15M losing momentum below threshold
             )
 
             # Expose signal values every cycle for log debugging

@@ -197,30 +197,43 @@ class AlpacaBroker:
                 return None, None
 
         # Step 2: Poll for fill (up to 15s)
+        # IMPORTANT: query the order DIRECTLY by ID, don't poll "filled" list
+        # which may not include the order and always loops through 5 recent fills
         filled_price = None
         deadline = time.time() + 15
         while time.time() < deadline:
             try:
-                orders = self._get(f"/v2/orders?status=filled&limit=5")
-                for o in orders:
-                    if o.get("id") == entry_order_id and o.get("status") == "filled":
-                        filled_price = float(o.get("filled_avg_price", entry_price))
-                        sys.stdout.write(f"[INFO] Alpaca entry FILL: {filled_price} (order {entry_order_id})\n")
-                        sys.stdout.flush()
-                        break
-                if filled_price:
+                order_status = self._get(f"/v2/orders/{entry_order_id}")
+                status = order_status.get("status", "")
+                sys.stdout.write(f"[INFO] Alpaca order status: {status} for {entry_order_id}\n")
+                sys.stdout.flush()
+                if status == "filled":
+                    fp_str = order_status.get("filled_avg_price")
+                    filled_price = float(fp_str) if fp_str else entry_price
+                    sys.stdout.write(f"[INFO] Alpaca entry FILL: {filled_price} (order {entry_order_id})\n")
+                    sys.stdout.flush()
                     break
+                elif status in ("rejected", "canceled", "expired"):
+                    sys.stdout.write(f"[ERROR] Alpaca order {status}: {entry_order_id}\n")
+                    sys.stdout.flush()
+                    break
+            except httpx.HTTPStatusError:
+                pass
             except Exception:
                 pass
-            time.sleep(1)
+            time.sleep(2)
 
         if filled_price is None:
-            filled_price = entry_price
-            sys.stdout.write(f"[WARN] Alpaca fill not confirmed for {symbol}, using estimate {entry_price}\n")
+            sys.stdout.write(f"[WARN] Alpaca entry not filled after 15s for {symbol} — not sending to Alpaca\n")
             sys.stdout.flush()
+            return None, None
 
-        # Step 3: Submit TP and SL after confirming entry fill price
-        self._submit_tp_sl(alpaca_sym, qty, order_side, filled_price, stop_loss_pct, take_profit_pct)
+        # Step 3: TP/SL not submitted to Alpaca — alpaca crypto rejects stop orders (40010001).
+        # TP/SL exit is managed by the strategy loop's exit check, which uses Binance live prices.
+        # Long entries ARE tracked in Alpaca (position visible in get_positions).
+        # If you want Alpaca-native TP/SL, open a LIVE account (not paper).
+        sys.stdout.write(f"[INFO] Alpaca entry filled @ {filled_price} — TP/SL managed by strategy loop\n")
+        sys.stdout.flush()
 
         return entry_order_id, filled_price
 
